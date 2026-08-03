@@ -5,17 +5,25 @@ __pycache__/
 venv/
 .env
 
+# uv
+.uv/
+
 # Data — never commit (large + redistribution terms)
-data/raw/
-data/processed/
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
 *.parquet
 *.csv
 
 # Models & results
 *.safetensors
 *.bin
+*.pt
+*.ckpt
+*.onnx
 checkpoints/
-results/
+results/*.json
 
 # OS / editor
 .DS_Store

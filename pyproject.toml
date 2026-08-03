@@ -1,0 +1,29 @@
+[project]
+name = "cogwar-bakeoff"
+version = "0.1.0"
+description = "Model selection bake-off for CIB detection in Hindi/English/Urdu."
+readme = "README.md"
+requires-python = "==3.11.*"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.0",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.1",
+]
+ml = [
+    "torch>=2.4",
+    "transformers>=4.44",
+    "datasets>=2.20",
+    "accelerate>=0.33",
+    "peft>=0.12",
+    "sentencepiece>=0.2.0",
+    "protobuf>=4.25",
+    "scikit-learn>=1.5",
+    "pandas>=2.2",
+    "pyarrow>=17.0",
+    "numpy>=1.26",
+    "bitsandbytes>=0.43 ; sys_platform == 'linux'",
+]
