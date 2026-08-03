@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Data — never commit (large + redistribution terms)
+data/raw/
+data/processed/
+*.parquet
+*.csv
+
+# Models & results
+*.safetensors
+*.bin
+checkpoints/
+results/
+
+# OS / editor
+.DS_Store
+.vscode/
