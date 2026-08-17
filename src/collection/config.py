@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_REQUIRED_VARS = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH")
+_REQUIRED_VARS = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "YOUTUBE_API_KEY")
 
 
 def _fail_missing(missing: list[str]) -> None:
@@ -21,7 +21,8 @@ def _fail_missing(missing: list[str]) -> None:
         + ", ".join(missing)
         + ".\n"
         "Create a .env file in the project root (see .env.example) with "
-        "your Telegram API credentials from https://my.telegram.org, "
+        "your Telegram API credentials from https://my.telegram.org and "
+        "your YouTube Data API v3 key from https://console.cloud.google.com/apis/credentials, "
         "then try again."
     )
 
@@ -47,6 +48,8 @@ TELEGRAM_SESSION_NAME: str = os.getenv("TELEGRAM_SESSION_NAME", "cogwar_collect"
 # tests) never touch the network. Set it in .env before running the
 # collector for the first time.
 TELEGRAM_PHONE: str | None = os.getenv("TELEGRAM_PHONE")
+
+YOUTUBE_API_KEY: str = os.environ["YOUTUBE_API_KEY"]
 
 DATA_OUTPUT_PATH: Path = Path(os.getenv("DATA_OUTPUT_PATH", "data/raw/"))
 ITEMS_DIR: Path = DATA_OUTPUT_PATH / "items"

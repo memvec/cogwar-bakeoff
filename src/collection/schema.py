@@ -144,6 +144,7 @@ class Observation(BaseModel):
     node_item_id: uuid.UUID  # the author/channel Item.item_id this observation is about
     observed_at: datetime
     subscriber_or_follower_count: int | None = None
+    view_count: int | None = None  # lifetime channel views where the source exposes it (e.g. YouTube); null for sources that don't (e.g. Telegram)
     post_count_seen: int | None = None
     verified_status: bool | None = None
     collection_run_id: str

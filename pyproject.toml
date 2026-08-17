@@ -42,4 +42,5 @@ collect = [
     "pydantic>=2.8",
     "pyarrow>=17.0",
     "langdetect>=1.0.9",
+    "google-api-python-client>=2.100",
 ]

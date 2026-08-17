@@ -1,6 +1,6 @@
 # Collection Layer — Canonical Schema Specification
 
-**Status:** LOCKED v0.5 — §8, §9 resolved; §1 `source_type` extended with `channel`/`author`; §9 clarified — Telegram `account_created_at` is always `null` (platform limitation), estimate lives in `source_specific` only (see §8, §9)
+**Status:** LOCKED v0.6 — §8, §9 resolved; §1 `source_type` extended with `channel`/`author`; §9 clarified — Telegram `account_created_at` is always `null` (platform limitation), estimate lives in `source_specific` only; §9 `observation` regained `view_count` for sources that expose it (e.g. YouTube) (see §8, §9)
 **Scope:** Layer 1 (Collection) of the four-layer stack.
 **Sources covered:** Telegram (public channels), YouTube (Data API v3), Fact-check + News (unstructured web).
 **Design model:** Option A — single universal `items` model + separate `edges` model. Every collected object is an `item`; every relationship is an `edge`. The coordination graph = items (nodes) + edges.
@@ -209,7 +209,8 @@ Promoted author/channel `item`s (§8.2) carry two kinds of data that must not be
 | `node_item_id` | string (UUID) | The author/channel `item_id` this observation is about. |
 | `observed_at` | datetime (UTC) | When this observation was taken (= this run's collection time). |
 | `subscriber_or_follower_count` | int \| null | |
-| `post_count_seen` | int \| null | Posts/messages seen by this collector as of this run — not necessarily the account's lifetime total. |
+| `view_count` | int \| null | Lifetime channel views, where the source exposes it (e.g. YouTube `statistics.viewCount`). Null for sources that don't (Telegram has no channel-level view total). |
+| `post_count_seen` | int \| null | Posts/messages seen by this collector as of this run — not necessarily the account's lifetime total. YouTube's `statistics.videoCount` (a real lifetime total from the source) is mapped here as the closest available field. |
 | `verified_status` | bool \| null | |
 | `collection_run_id` | string | Ties the observation to the run/batch that produced it (§5). |
 
