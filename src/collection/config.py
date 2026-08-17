@@ -41,4 +41,15 @@ except ValueError as exc:
 
 TELEGRAM_API_HASH: str = os.environ["TELEGRAM_API_HASH"]
 TELEGRAM_SESSION_NAME: str = os.getenv("TELEGRAM_SESSION_NAME", "cogwar_collect")
+
+# Only needed for the one-time interactive Telethon login (client.start());
+# not required at import time since most code paths (e.g. schema/writers
+# tests) never touch the network. Set it in .env before running the
+# collector for the first time.
+TELEGRAM_PHONE: str | None = os.getenv("TELEGRAM_PHONE")
+
 DATA_OUTPUT_PATH: Path = Path(os.getenv("DATA_OUTPUT_PATH", "data/raw/"))
+ITEMS_DIR: Path = DATA_OUTPUT_PATH / "items"
+EDGES_DIR: Path = DATA_OUTPUT_PATH / "edges"
+OBSERVATIONS_DIR: Path = DATA_OUTPUT_PATH / "observations"
+PAYLOADS_DIR: Path = DATA_OUTPUT_PATH / "payloads"

@@ -1,6 +1,6 @@
 # Collection Layer — Canonical Schema Specification
 
-**Status:** LOCKED v0.2 — §8 resolved (see §8)
+**Status:** LOCKED v0.5 — §8, §9 resolved; §1 `source_type` extended with `channel`/`author`; §9 clarified — Telegram `account_created_at` is always `null` (platform limitation), estimate lives in `source_specific` only (see §8, §9)
 **Scope:** Layer 1 (Collection) of the four-layer stack.
 **Sources covered:** Telegram (public channels), YouTube (Data API v3), Fact-check + News (unstructured web).
 **Design model:** Option A — single universal `items` model + separate `edges` model. Every collected object is an `item`; every relationship is an `edge`. The coordination graph = items (nodes) + edges.
@@ -25,7 +25,7 @@ Every collected object — a Telegram message, a YouTube video, a YouTube commen
 | Field | Type | Notes |
 |---|---|---|
 | `item_id` | string (UUID) | Internal universal ID. Primary key. The graph node ID. |
-| `source_type` | enum | `telegram` \| `youtube_video` \| `youtube_comment` \| `news` \| `factcheck` |
+| `source_type` | enum | `telegram` \| `youtube_video` \| `youtube_comment` \| `news` \| `factcheck` \| `channel` \| `author` — the last two are promoted author/channel nodes (§8.2, §9), generic across sources rather than source-prefixed. |
 | `source_native_id` | string | The source's own ID (Telegram msg id, YT video/comment id, article canonical URL). |
 | `parent_item_id` | string (UUID) \| null | For nested items (a YT comment's video; a reply's parent). Structural containment, not a graph edge. |
 | `text` | string \| null | Primary textual content (message text, video title+description, article body, comment text). |
@@ -45,6 +45,8 @@ Every collected object — a Telegram message, a YouTube video, a YouTube commen
 | `provenance` | JSON | Collection provenance block — see §5. Mandatory, never null. |
 | `extraction_confidence` | float (0–1) \| null | For unstructured sources: parser's confidence. Null for clean API sources (implicitly 1.0). |
 | `content_hashes` | JSON | `{text_hash, phash, video_fp, url_hashes[]}` — for cross-item / cross-source matching. Derived. |
+
+Two additional fields, `account_created_at` and derived `account_age_at_observation`, exist on the model but are populated only for promoted author/channel nodes — see §9.
 
 ---
 
@@ -169,6 +171,9 @@ Edges are captured at collection where visible, and computed later where derived
 - **No origin/actor attribution.** Coarse-origin *cues* are captured as fields (declared country, language/script, fact-check claimed-origin) but not resolved into a verdict here.
 - **No treating fact-check verdicts as truth.** They are source assertions with a named asserter.
 - **No labels baked into items.** Ground-truth labelling (for the eventual model work) is a separate annotation layer keyed on `item_id`, not a collection field.
+- **No narrative/campaign scoring.** Coordination-network / campaign-level scoring is the detection layer's job — a separate spec. Collection captures the graph; it does not score it (design principle 5, §0 — also see §9's derived-trajectory note).
+- **WhatsApp — permanent blind spot, not deferred.** End-to-end encrypted; no lawful bulk-OSINT collection path exists. Excluded by design, not by current capability.
+- **Facebook — deferred, not excluded.** The schema fits Facebook content without modification (it's another `item` source). The blocker is sourcing/access (API restrictions), not schema design. Revisit if/when a collection path becomes available.
 
 ---
 
@@ -185,3 +190,27 @@ Edges are captured at collection where visible, and computed later where derived
 5. **Fact-check verdicts — LOCKED (source assertions).** Captured as named assertions (`asserting_source` + verdict), never as system ground truth. See §4.
 
 6. **Extraction confidence scale.** Single float for now; revisit per-field only if a downstream layer needs it.
+
+---
+
+## 9. Author/channel nodes — observation history + reputation fields (LOCKED)
+
+Promoted author/channel `item`s (§8.2) carry two kinds of data that must not be conflated:
+
+- **Identity fields — stable, live on the node.** `account_created_at` (account/channel creation date, populated from the source only when it is a real source-declared value). A derived `account_age_at_observation` (creation date → this item's collection time) rides alongside it. **`account_created_at` is the core dummy-account detection signal** — a brand-new account posting at high volume is exactly the pattern this field exists to make computable. **Telegram is a platform limitation, not a bug:** the API exposes no creation-date field anywhere, so `account_created_at` (and therefore `account_age_at_observation`) stays `null` for every Telegram channel item, full stop — no approximation is written into the real field. A best-effort estimate (the channel's earliest retrievable message timestamp) is instead captured under `source_specific.estimated_creation_from_earliest_msg`, explicitly named as an estimate so it can never be mistaken for the source-declared value downstream.
+- **Reputation fields — volatile, NEVER overwritten on the node.** Subscriber/follower count, post count, verified status, and view count change on every run. Writing them onto the node and overwriting on each pass would destroy the account's trajectory — exactly the signal a dummy/sockpuppet-account detector needs (e.g. brand-new account, near-zero followers, sudden high-volume posting).
+
+**Observations are a time series, not a snapshot.** Every collection run appends one `observation` row per author/channel node it saw, to a *separate* output — `data/raw/observations/`, parquet, one file per `collection_run_id` — rather than mutating the node or an embedded list on it. Parquet files are immutable once written, so "append" is naturally "write a new file": there is no in-place mutation to get wrong. DuckDB reads the whole directory as one time-series table (`read_parquet('data/raw/observations/*.parquet')`) with no merge logic required on the collection side. Re-running the collector must always add a new file, keyed on a fresh `collection_run_id`; it must never open and rewrite a prior run's file.
+
+**`observation` fields:**
+
+| Field | Type | Notes |
+|---|---|---|
+| `node_item_id` | string (UUID) | The author/channel `item_id` this observation is about. |
+| `observed_at` | datetime (UTC) | When this observation was taken (= this run's collection time). |
+| `subscriber_or_follower_count` | int \| null | |
+| `post_count_seen` | int \| null | Posts/messages seen by this collector as of this run — not necessarily the account's lifetime total. |
+| `verified_status` | bool \| null | |
+| `collection_run_id` | string | Ties the observation to the run/batch that produced it (§5). |
+
+**Downstream, not here.** Follower-growth rate, posting-velocity change, and other trajectory metrics are *derived* from the `observations` time series by the DuckDB processing layer, not computed at collection time (design principle 5, §0 — collection captures signal, it does not interpret it).

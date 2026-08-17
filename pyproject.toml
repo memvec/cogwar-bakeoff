@@ -40,4 +40,6 @@ collect = [
     "telethon>=1.36",
     "python-dotenv>=1.0",
     "pydantic>=2.8",
+    "pyarrow>=17.0",
+    "langdetect>=1.0.9",
 ]
