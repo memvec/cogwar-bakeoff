@@ -13,8 +13,10 @@ venv/
 # Data — never commit (large + redistribution terms)
 data/raw/*
 data/processed/*
+data/state/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
+!data/state/.gitkeep
 *.parquet
 *.csv
 

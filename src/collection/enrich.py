@@ -11,7 +11,9 @@ collector (YouTube, news) without repeating this logic per-source.
 from __future__ import annotations
 
 import hashlib
+import io
 import re
+import urllib.request
 
 try:
     from langdetect import DetectorFactory, LangDetectException, detect
@@ -20,6 +22,13 @@ try:
 except ImportError:  # pragma: no cover -- collect group not installed
     detect = None
     LangDetectException = Exception  # type: ignore[assignment,misc]
+
+try:
+    import imagehash
+    from PIL import Image
+except ImportError:  # pragma: no cover -- collect group not installed
+    imagehash = None  # type: ignore[assignment]
+    Image = None  # type: ignore[assignment]
 
 _URL_STRIP_RE = re.compile(r"https?://\S+|www\.\S+")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -185,6 +194,31 @@ def compute_media_hash(media: list[dict] | None) -> str | None:
     if not refs:
         return None
     return hashlib.sha256(":".join(refs).encode("utf-8")).hexdigest()
+
+
+def compute_thumbnail_phash(url: str, timeout: float = 10.0) -> str | None:
+    """Perceptual hash (pHash, NOT an exact hash) of an image fetched from `url`.
+
+    Skip-on-fail -> None; never raises -- a dead link, a transient network
+    error, or an undecodable image are routine, expected outcomes here, not
+    something that should crash a collection run. Unlike compute_media_hash
+    (which hashes a source-native file id, exact-match only), a perceptual
+    hash tolerates re-encoding/resizing, so it can catch near-identical
+    thumbnails a byte-exact hash would miss -- a second, fuzzier signal
+    feeding the shared_media derived edge (doc §6) alongside media_hash.
+    Not called automatically by Item construction (unlike the rest of this
+    module) -- it needs a network fetch, so the caller (youtube/collector.py)
+    controls when/how politely it happens.
+    """
+    if imagehash is None or Image is None:
+        return None
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = resp.read()
+        img = Image.open(io.BytesIO(data))
+        return str(imagehash.phash(img))
+    except Exception:  # noqa: BLE001 -- deliberately broad: any fetch/decode failure here is skip-on-fail, not a bug to surface
+        return None
 
 
 def enrich_item_fields(text: str | None, media: list[dict] | None) -> dict:

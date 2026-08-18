@@ -28,6 +28,9 @@ _DURATION_RE = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
 _YOUTUBE_VIDEO_RE = re.compile(r"(?:youtu\.be/|youtube\.com/watch\?v=)([\w-]{6,})")
 _YOUTUBE_CHANNEL_RE = re.compile(r"youtube\.com/channel/([\w-]+)")
 
+# Best-to-worst; used to pick the single thumbnail_url a video's pHash gets computed from (collector.py).
+_THUMBNAIL_SIZE_PRIORITY = ["maxres", "standard", "high", "medium", "default"]
+
 # youtube video_id -> item_id / youtube channel_id -> item_id, for in-run
 # resolution of description-link targets. Populated by collector.py as it
 # builds each video/channel Item.
@@ -66,6 +69,14 @@ def parse_duration(iso_duration: str | None) -> int | None:
     return hours * 3600 + minutes * 60 + seconds
 
 
+def _pick_best_thumbnail_url(thumbnails: dict) -> str | None:
+    for size in _THUMBNAIL_SIZE_PRIORITY:
+        info = thumbnails.get(size)
+        if info and info.get("url"):
+            return info["url"]
+    return None
+
+
 def build_video_item(
     video: dict,
     channel_item_id: uuid.UUID,
@@ -73,12 +84,20 @@ def build_video_item(
     raw_payload_ref: str,
     collected_at: datetime,
 ) -> Item:
-    """Map a `videos.list` resource into a canonical `youtube_video` Item (doc §1, §3)."""
+    """Map a `videos.list` resource into a canonical `youtube_video` Item (doc §1, §3).
+
+    `source_specific.thumbnail_url` (the single highest-res thumbnail,
+    keep_thumbnail_url) is set here but NOT fetched/hashed here -- that's a
+    network call, and mapping.py stays free of those (collector.py owns
+    fetching + pHash'ing it into content_hashes.thumbnail_phash, politely
+    and with skip-on-fail, after this Item is constructed).
+    """
     snippet = video.get("snippet", {})
     stats = video.get("statistics", {})
     content_details = video.get("contentDetails", {})
     title = snippet.get("title", "")
     description = snippet.get("description", "")
+    thumbnails = snippet.get("thumbnails", {})
 
     return Item(
         source_type=SourceType.youtube_video,
@@ -104,9 +123,8 @@ def build_video_item(
             "duration_seconds": parse_duration(content_details.get("duration")),
             "definition": content_details.get("definition"),
             "is_live_broadcast": snippet.get("liveBroadcastContent", "none") != "none",
-            "thumbnail_urls": {
-                size: info.get("url") for size, info in snippet.get("thumbnails", {}).items()
-            },
+            "thumbnail_urls": {size: info.get("url") for size, info in thumbnails.items()},
+            "thumbnail_url": _pick_best_thumbnail_url(thumbnails),
         },
         raw_payload_ref=raw_payload_ref,
         provenance=_provenance(run_id, raw_payload_ref, collected_at),
