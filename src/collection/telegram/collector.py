@@ -15,6 +15,19 @@ its high_water_mark (last collected message_id). Observations are exempt --
 collected every run regardless of mode, since the follower-count time
 series needs a data point on every pass, not just on new content.
 
+Durability invariant: a channel's checkpoint must never advance until that
+channel's items/edges/observations are durably on disk. Each channel is
+written to its own file (writers.py's `file_key`) and fsync'd immediately
+after collect_channel() returns, and only then is its checkpoint set --
+see collect_and_persist_all. If the process is killed at any point, every
+channel fully processed before the kill is both written and checkpointed;
+the channel being processed at the moment of the kill (or any not yet
+reached) has neither, so it backfills or resumes incrementally next run --
+never a silent gap. (Previously, checkpoints advanced per-channel during
+the run but items/edges were only written in one batch at the very end --
+a kill after the last checkpoint update but before that final write left
+checkpoints pointing past data that was never persisted.)
+
 Before collecting, mines already-collected edges for forward-origin
 channels we've never pulled ourselves and adds them to this run's seed set
 (see mine_forward_target_channel_ids) -- newly-added channels have no
@@ -168,6 +181,28 @@ async def _call_with_flood_wait(fn, *args, **kwargs):
         return await fn(*args, **kwargs)
 
 
+class ChannelResult:
+    """Everything one channel's collection produced, plus what the caller needs to durably persist it and only then advance its checkpoint."""
+
+    def __init__(
+        self,
+        channel_key: str,
+        channel_item: Item,
+        observation: Observation,
+        message_items: list[Item],
+        edges: list[Edge],
+        new_high_water_mark: str | None,
+        mode: str,
+    ) -> None:
+        self.channel_key = channel_key
+        self.channel_item = channel_item
+        self.observation = observation
+        self.message_items = message_items
+        self.edges = edges
+        self.new_high_water_mark = new_high_water_mark
+        self.mode = mode
+
+
 async def collect_channel(
     client: TelegramClient,
     handle: str | int,
@@ -175,7 +210,7 @@ async def collect_channel(
     max_per_channel: int,
     months: int,
     stats: RunStats,
-) -> tuple[Item, Observation, list[Item], list[Edge]] | None:
+) -> ChannelResult | None:
     """Collect one channel's identity, reputation observation, and message history.
 
     Checkpoint-driven: no prior checkpoint for this channel -> backfill the
@@ -185,6 +220,13 @@ async def collect_channel(
     `max_per_channel` allows, the checkpoint still only advances to the
     newest message actually fetched -- never skipping a gap that a future
     run wouldn't come back for.
+
+    Does NOT write anything to disk or touch checkpoints.py -- it only
+    computes the new high_water_mark and returns it. The caller
+    (collect_and_persist_all) is responsible for durably writing this
+    channel's data and only then advancing its checkpoint; keeping that
+    ordering out of this function's hands is what makes the invariant
+    enforceable in exactly one place.
 
     Returns None (recording the skip in `stats`) for any dead, invalid, or
     private channel, or a flood-wait too long to be worth blocking the whole
@@ -271,8 +313,6 @@ async def collect_channel(
         new_hwm = max_msg_id_seen if max_msg_id_seen is not None else (
             checkpoint.high_water_mark if checkpoint else None
         )
-        if new_hwm is not None:
-            checkpoints.set_checkpoint(CHECKPOINT_SOURCE, channel_key, str(new_hwm), run_id)
 
         print(f"[collector] {handle}: {mode} -- {message_count} new item(s)", flush=True)
         if mode == "backfill":
@@ -280,7 +320,15 @@ async def collect_channel(
         else:
             stats.incremental_channels += 1
 
-        return channel_item, observation, message_items, edges
+        return ChannelResult(
+            channel_key=channel_key,
+            channel_item=channel_item,
+            observation=observation,
+            message_items=message_items,
+            edges=edges,
+            new_high_water_mark=str(new_hwm) if new_hwm is not None else None,
+            mode=mode,
+        )
 
     except FloodWaitError as e:
         print(
@@ -296,13 +344,64 @@ async def collect_channel(
         return None
 
 
+def persist_channel_result(result: ChannelResult, run_id: str) -> None:
+    """Durably write one channel's items/edges/observations, then -- only then -- advance its checkpoint.
+
+    This function IS the durability invariant: writers.write_* fsync before
+    returning (writers.py), so by the time checkpoints.set_checkpoint runs,
+    this channel's data is confirmed on disk. Split out from
+    collect_and_persist_all's loop so a test can call it directly per
+    channel and assert on filesystem + checkpoint state between calls.
+    """
+    file_key = f"{run_id}__{result.channel_key}"
+    all_items = [result.channel_item, *result.message_items]
+
+    writers.write_items(all_items, run_id, config.ITEMS_DIR, file_key=file_key)
+    if result.edges:
+        writers.write_edges(result.edges, run_id, config.EDGES_DIR, file_key=file_key)
+    writers.write_observations(
+        [result.observation], run_id, config.OBSERVATIONS_DIR, file_key=file_key
+    )
+
+    if result.new_high_water_mark is not None:
+        checkpoints.set_checkpoint(
+            CHECKPOINT_SOURCE, result.channel_key, result.new_high_water_mark, run_id
+        )
+
+
+async def collect_and_persist_all(
+    client: TelegramClient,
+    handles: list[str | int],
+    run_id: str,
+    max_per_channel: int,
+    months: int,
+    stats: RunStats,
+) -> None:
+    """Collect each handle in turn, durably persisting + checkpointing it before moving to the next.
+
+    Takes an already-started `client` rather than owning its lifecycle, so
+    it can be tested with a stub client and a monkeypatched collect_channel
+    -- no real Telethon connection required.
+    """
+    for handle in handles:
+        result = await collect_channel(client, handle, run_id, max_per_channel, months, stats)
+        if result is None:
+            continue
+
+        persist_channel_result(result, run_id)
+
+        stats.channels += 1
+        stats.items += 1 + len(result.message_items)
+        stats.observations += 1
+        stats.record_edges(result.edges)
+
+        await asyncio.sleep(CHANNEL_SLEEP_SECONDS)
+
+
 async def run_collection(
     handles: list[str | int], run_id: str, max_per_channel: int, months: int
-) -> tuple[list[Item], list[Edge], list[Observation], RunStats]:
+) -> RunStats:
     stats = RunStats()
-    all_items: list[Item] = []
-    all_edges: list[Edge] = []
-    all_observations: list[Observation] = []
 
     client = TelegramClient(
         config.TELEGRAM_SESSION_NAME, config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH
@@ -313,26 +412,11 @@ async def run_collection(
         password=_fifo_reader("2FA password"),
     )
     try:
-        for handle in handles:
-            result = await collect_channel(client, handle, run_id, max_per_channel, months, stats)
-            if result is None:
-                continue
-            channel_item, observation, message_items, edges = result
-            stats.channels += 1
-            stats.items += 1 + len(message_items)
-            stats.observations += 1
-            stats.record_edges(edges)
-
-            all_items.append(channel_item)
-            all_items.extend(message_items)
-            all_edges.extend(edges)
-            all_observations.append(observation)
-
-            await asyncio.sleep(CHANNEL_SLEEP_SECONDS)
+        await collect_and_persist_all(client, handles, run_id, max_per_channel, months, stats)
     finally:
         await client.disconnect()
 
-    return all_items, all_edges, all_observations, stats
+    return stats
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -366,16 +450,7 @@ def main(argv: list[str] | None = None) -> None:
         flush=True,
     )
 
-    items, edges, observations, stats = asyncio.run(
-        run_collection(handles, run_id, args.max_per_channel, args.months)
-    )
-
-    if items:
-        writers.write_items(items, run_id, config.ITEMS_DIR)
-    if edges:
-        writers.write_edges(edges, run_id, config.EDGES_DIR)
-    if observations:
-        writers.write_observations(observations, run_id, config.OBSERVATIONS_DIR)
+    stats = asyncio.run(run_collection(handles, run_id, args.max_per_channel, args.months))
 
     print("\n--- Collection summary ---")
     print(f"Channels collected: {stats.channels} (backfill={stats.backfill_channels}, incremental={stats.incremental_channels})")

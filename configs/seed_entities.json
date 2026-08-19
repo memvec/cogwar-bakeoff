@@ -1,0 +1,25 @@
+{
+  "_comment": "Placeholder seed entity list (docs/analysis_layer_spec.md §1.1, §5.4). Replace with the real controlled list derived from the collection scope / threat model. entity_type is one of: country, person, brand, org, topic, other. aliases[] should include the canonical_name itself plus known variant spellings/scripts -- the loader also always adds canonical_name as an alias, so it doesn't need to be repeated there.",
+  "entities": [
+    {
+      "canonical_name": "India",
+      "entity_type": "country",
+      "aliases": ["Bharat", "भारत", "IND", "🇮🇳"]
+    },
+    {
+      "canonical_name": "Pakistan",
+      "entity_type": "country",
+      "aliases": ["پاکستان", "PAK", "🇵🇰"]
+    },
+    {
+      "canonical_name": "Narendra Modi",
+      "entity_type": "person",
+      "aliases": ["Modi", "PM Modi", "नरेंद्र मोदी", "مودی"]
+    },
+    {
+      "canonical_name": "Kashmir",
+      "entity_type": "topic",
+      "aliases": ["Jammu and Kashmir", "J&K", "IIOJK", "کشمیر", "कश्मीर"]
+    }
+  ]
+}
