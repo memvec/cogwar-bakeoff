@@ -1,6 +1,7 @@
 """Stance detection pass -- CLI entrypoint (docs/analysis_layer_spec.md §4 pass 2).
 
-    uv run python -m analysis.detect_stance --clusters-only --limit 50
+    uv run python -m analysis.detect_stance --provider gemini --clusters-only
+    uv run python -m analysis.detect_stance --provider gemini --no-clusters-only --max-cost 50
 
 Reads items + their resolved entities (item_entities, from the entity
 extraction pass) from the analysis DuckDB, asks the configured
@@ -12,19 +13,25 @@ built here.
 
 One API call per ITEM, not per (item, entity) pair: all of an item's
 entities that still need a stance are batched into a single prompt (same
-economy as extraction). Cost control, two layers deep:
+economy as extraction). Cost control, several layers deep:
   - Content cache: an (item, entity) pair whose text_hash + entity_id was
     already scored -- even under a different item_id (e.g. a repost) --
     is served from stance_cache with zero API calls.
   - Incremental: an item where every one of its entities already has an
-    entity_stance_edges row is skipped entirely, no cache lookups needed.
-    A rerun only ever processes the (item, entity) pairs still missing a
-    cached/persisted result -- if an item gained a new entity since its
-    last run (e.g. a merge), only that entity's pair is processed.
+    entity_stance_edges row is skipped entirely, no cache lookups needed --
+    this is also what makes a provider switch (Anthropic -> Gemini)
+    additive: pairs an earlier Anthropic run already scored stay
+    Anthropic-labeled (entity_stance_edges.detector_model records which),
+    and a Gemini run only ever processes what's still pending.
+  - --max-cost: stop cleanly once running spend would exceed the cap --
+    every item's writes are already committed as they happen, so a rerun
+    just continues via the caches above.
 --clusters-only (default true) restricts the candidate set to items that
 appear in any derived edge (near_duplicate_text / shared_media /
-temporal_cocluster), same coordination-cluster-first discipline as the
-entity extraction pass.
+temporal_cocluster). With --no-clusters-only, ALL items with pending
+(item, entity) pairs are candidates, but cluster-membership still
+determines priority order (cluster items first), same discipline as
+extract_entities.py.
 
 Neutral/noise threshold (spec §5.5): most entity mentions are incidental
 with no real stance. Default behavior emits the edge regardless, with
@@ -37,18 +44,29 @@ from __future__ import annotations
 import argparse
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import duckdb
 
 from analysis import config, resolution, stance_storage
+from analysis.cost import CostTracker
+from analysis.gemini_retry import (
+    GeminiBillingExhaustedError,
+    GeminiDailyQuotaExhaustedError,
+    GeminiFreeTierError,
+)
 from analysis.stance import (
-    AnthropicStanceDetector,
     EntityRef,
     StanceDetector,
     StanceResult,
+    build_detector_pool,
 )
 
-API_CALL_SLEEP_SECONDS = 0.3
+# Pause between BATCHES (not per-call) -- courtesy pacing once concurrency
+# is already doing the real throughput work.
+BATCH_SLEEP_SECONDS = 0.2
+PROGRESS_EVERY = 25
+DEFAULT_CONCURRENCY = 8
 
 _CLUSTER_EDGE_TYPES = ("near_duplicate_text", "shared_media", "temporal_cocluster")
 
@@ -65,6 +83,8 @@ class RunStats:
         self.polarity_counts: Counter = Counter()  # over all (item, entity) pairs decided, incl. skipped
         self.detection_gaps: list[tuple[str, str, str]] = []  # (item_id, entity_id, canonical_name) model omitted
         self.empty_response_items: list[tuple[str, str]] = []  # (item_id, text snippet) -- API call returned nothing at all
+        self.failed_items: list[tuple[str, str]] = []  # (item_id, error message) -- retries exhausted, skipped, will retry next run
+        self.stopped_early_reason: str | None = None
 
 
 def connect(read_only_processed: bool = True) -> duckdb.DuckDBPyConnection:
@@ -81,15 +101,12 @@ def connect(read_only_processed: bool = True) -> duckdb.DuckDBPyConnection:
     return con
 
 
-def select_candidate_items(con: duckdb.DuckDBPyConnection, clusters_only: bool, limit: int) -> list[dict]:
-    """Items with resolved entities where at least one (item, entity) pair
-    still lacks an entity_stance_edges row, optionally restricted to
-    coordination clusters."""
+def _candidate_query(clusters_only: bool) -> tuple[str, str, str]:
+    """Returns (cluster_cte, cluster_join, priority_expr) -- shared between
+    select_candidate_items (needs LIMIT) and count_remaining_candidates
+    (needs none)."""
     edge_types_sql = ", ".join(f"'{t}'" for t in _CLUSTER_EDGE_TYPES)
-    cluster_cte = ""
-    cluster_join = ""
-    if clusters_only:
-        cluster_cte = f""",
+    cluster_cte = f""",
         cluster_items AS (
             SELECT src_item_id AS item_id FROM processed.edges
             WHERE origin = 'derived' AND edge_type IN ({edge_types_sql})
@@ -97,7 +114,22 @@ def select_candidate_items(con: duckdb.DuckDBPyConnection, clusters_only: bool, 
             SELECT dst_item_id AS item_id FROM processed.edges
             WHERE origin = 'derived' AND edge_type IN ({edge_types_sql}) AND dst_item_id IS NOT NULL
         )"""
+    if clusters_only:
         cluster_join = "JOIN cluster_items c ON iec.item_id = c.item_id"
+        priority_expr = "(1)"  # constant -- NOT a bare int literal (DuckDB treats that as a positional ORDER BY reference)
+    else:
+        # Full corpus is candidate, but cluster items still sort first --
+        # same priority discipline as extract_entities.py.
+        cluster_join = "LEFT JOIN cluster_items c ON iec.item_id = c.item_id"
+        priority_expr = "CASE WHEN c.item_id IS NOT NULL THEN 0 ELSE 1 END"
+    return cluster_cte, cluster_join, priority_expr
+
+
+def select_candidate_items(con: duckdb.DuckDBPyConnection, clusters_only: bool, limit: int | None) -> list[dict]:
+    """Items with resolved entities where at least one (item, entity) pair
+    still lacks an entity_stance_edges row, ordered cluster-items-first."""
+    cluster_cte, cluster_join, priority_expr = _candidate_query(clusters_only)
+    limit_clause = "LIMIT ?" if limit is not None else ""
 
     query = f"""
         WITH item_entity_counts AS (
@@ -115,11 +147,39 @@ def select_candidate_items(con: duckdb.DuckDBPyConnection, clusters_only: bool, 
         {cluster_join}
         WHERE i.text IS NOT NULL AND i.text_hash IS NOT NULL
           AND (iee.n_edges IS NULL OR iee.n_edges < iec.n_entities)
-        LIMIT ?
+        ORDER BY {priority_expr}, i.item_id
+        {limit_clause}
     """
-    rows = con.execute(query, [limit]).fetchall()
+    params = [limit] if limit is not None else []
+    rows = con.execute(query, params).fetchall()
     columns = ["item_id", "text", "text_hash", "language_detected", "script", "source_type"]
     return [dict(zip(columns, row, strict=True)) for row in rows]
+
+
+def count_remaining_candidates(con: duckdb.DuckDBPyConnection, clusters_only: bool) -> int:
+    """Total pending candidates with no LIMIT -- the denominator for
+    progress printing."""
+    cluster_cte, cluster_join, _ = _candidate_query(clusters_only)
+    query = f"""
+        WITH item_entity_counts AS (
+            SELECT item_id, count(DISTINCT entity_id) AS n_entities
+            FROM item_entities GROUP BY item_id
+        ),
+        item_edge_counts AS (
+            SELECT item_id, count(DISTINCT entity_id) AS n_edges
+            FROM entity_stance_edges GROUP BY item_id
+        ){cluster_cte}
+        SELECT count(*)
+        FROM item_entity_counts iec
+        LEFT JOIN item_edge_counts iee ON iec.item_id = iee.item_id
+        JOIN processed.items i ON i.item_id = iec.item_id
+        {cluster_join}
+        WHERE i.text IS NOT NULL AND i.text_hash IS NOT NULL
+          AND (iee.n_edges IS NULL OR iee.n_edges < iec.n_entities)
+    """
+    row = con.execute(query).fetchone()
+    assert row is not None
+    return row[0]
 
 
 def estimate_api_calls(con: duckdb.DuckDBPyConnection, items: list[dict]) -> int:
@@ -140,63 +200,23 @@ def estimate_api_calls(con: duckdb.DuckDBPyConnection, items: list[dict]) -> int
     return estimated
 
 
-def process_item(
-    con: duckdb.DuckDBPyConnection,
-    detector: StanceDetector,
-    item: dict,
-    stats: RunStats,
-    skip_neutral: bool,
-) -> list[tuple[EntityRef, StanceResult]]:
-    """Score (via cache or one batched API call) + persist one item's
-    pending (item, entity) stance pairs. Returns [(entity, result), ...]
-    for every pending entity, regardless of skip_neutral (callers decide
-    what to do with that for reporting)."""
+def _get_pending(con: duckdb.DuckDBPyConnection, item: dict) -> list[EntityRef]:
     entities = stance_storage.get_item_entities(con, item["item_id"])
     existing = stance_storage.get_existing_edge_entity_ids(con, item["item_id"])
-    pending = [e for e in entities if e.entity_id not in existing]
-    if not pending:
-        return []
+    return [e for e in entities if e.entity_id not in existing]
 
-    cached_results: dict[str, StanceResult] = {}
-    uncached_entities: list[EntityRef] = []
-    for e in pending:
-        cached = stance_storage.get_cached_stance(con, item["text_hash"], e.entity_id)
-        if cached is not None:
-            cached_results[e.entity_id] = cached
-        else:
-            uncached_entities.append(e)
-    stats.pairs_from_cache += len(cached_results)
 
-    new_results: dict[str, StanceResult] = {}
-    if uncached_entities:
-        context = {
-            "language_detected": item["language_detected"],
-            "script": item["script"],
-            "source_type": item["source_type"],
-        }
-        detected = detector.detect(item["text"], uncached_entities, context=context)
-        stats.api_calls += 1
-        time.sleep(API_CALL_SLEEP_SECONDS)
-
-        if not detected:
-            stats.empty_response_items.append((item["item_id"], (item["text"] or "")[:80]))
-
-        by_id = {r.entity_id: r for r in detected}
-        for e in uncached_entities:
-            result = by_id.get(e.entity_id)
-            if result is None:
-                # Model omitted this entity from its response -- fall back to
-                # a zero-confidence neutral edge rather than dropping the
-                # pair silently, and flag it as a detection gap in the report.
-                result = StanceResult(entity_id=e.entity_id, polarity="neutral", strength=0.0, confidence=0.0)
-                stats.detection_gaps.append((item["item_id"], e.entity_id, e.canonical_name))
-            stance_storage.store_stance_cache(con, item["text_hash"], result, model=config.ANTHROPIC_MODEL)
-            new_results[e.entity_id] = result
-        stats.pairs_from_api += len(uncached_entities)
-    else:
-        stats.items_fully_cached += 1
-
-    all_results = {**cached_results, **new_results}
+def _finalize_item(
+    con: duckdb.DuckDBPyConnection,
+    item: dict,
+    pending: list[EntityRef],
+    all_results: dict[str, StanceResult],
+    stats: RunStats,
+    skip_neutral: bool,
+    model: str,
+) -> list[tuple[EntityRef, StanceResult]]:
+    """Persist one item's already-scored (cache + fresh) results. Always
+    runs on the main thread/connection, never inside a worker."""
     resolved = []
     for e in pending:
         result = all_results[e.entity_id]
@@ -204,7 +224,7 @@ def process_item(
         if skip_neutral and result.polarity == "neutral":
             stats.skipped_neutral += 1
         else:
-            stance_storage.record_stance_edge(con, item["item_id"], result, model=config.ANTHROPIC_MODEL)
+            stance_storage.record_stance_edge(con, item["item_id"], result, model=model)
             stats.edges_written += 1
         resolved.append((e, result))
 
@@ -213,13 +233,24 @@ def process_item(
 
 
 def run(
-    clusters_only: bool, limit: int, skip_neutral: bool, detector: StanceDetector
-) -> tuple[RunStats, duckdb.DuckDBPyConnection]:
+    clusters_only: bool,
+    limit: int | None,
+    skip_neutral: bool,
+    detectors: list[StanceDetector],
+    model: str,
+    cost_tracker: CostTracker,
+) -> tuple[RunStats, duckdb.DuckDBPyConnection, CostTracker]:
+    """`detectors` is a pool of `concurrency` independent instances (see
+    stance.build_detector_pool) -- within one batch, slot i always calls
+    detectors[i], so no two threads ever touch the same instance at once."""
     con = connect()
+    concurrency = len(detectors)
 
+    total_remaining = count_remaining_candidates(con, clusters_only)
     items = select_candidate_items(con, clusters_only, limit)
     print(
-        f"[detect_stance] candidate items: {len(items)} (clusters_only={clusters_only}, limit={limit})",
+        f"[detect_stance] candidate items this invocation: {len(items)} "
+        f"(clusters_only={clusters_only}, limit={limit}); {total_remaining} total pending; concurrency={concurrency}",
         flush=True,
     )
 
@@ -227,10 +258,111 @@ def run(
     print(f"[detect_stance] estimated API calls: {estimated}", flush=True)
 
     stats = RunStats()
-    for item in items:
-        process_item(con, detector, item, stats, skip_neutral)
+    last_progress_print = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        for batch_start in range(0, len(items), concurrency):
+            if cost_tracker.would_exceed():
+                stats.stopped_early_reason = f"cost cap (${cost_tracker.max_cost:.2f}) reached"
+                print(f"\n[detect_stance] STOPPING: {stats.stopped_early_reason}. Rerun to continue -- already-scored pairs are cached.", flush=True)
+                break
 
-    return stats, con
+            batch = items[batch_start : batch_start + concurrency]
+
+            # Cache lookups + "who's pending" are cheap sequential DB reads.
+            # An item with nothing pending is skipped; an item fully served
+            # from stance_cache is finalized immediately with no API call.
+            # to_call holds one 4-tuple per item that needs a real API call:
+            # (item, pending, uncached_entities, cached_results) -- carrying
+            # cached_results alongside so it can be merged with the fresh
+            # results after the call, without any shared/side-channel state.
+            to_call: list[tuple[dict, list[EntityRef], list[EntityRef], dict[str, StanceResult]]] = []
+            for item in batch:
+                pending = _get_pending(con, item)
+                if not pending:
+                    continue
+                cached_results: dict[str, StanceResult] = {}
+                uncached_entities: list[EntityRef] = []
+                for e in pending:
+                    cached = stance_storage.get_cached_stance(con, item["text_hash"], e.entity_id)
+                    if cached is not None:
+                        cached_results[e.entity_id] = cached
+                    else:
+                        uncached_entities.append(e)
+                stats.pairs_from_cache += len(cached_results)
+
+                if not uncached_entities:
+                    stats.items_fully_cached += 1
+                    _finalize_item(con, item, pending, cached_results, stats, skip_neutral, model)
+                else:
+                    to_call.append((item, pending, uncached_entities, cached_results))
+
+            if to_call:
+                futures = {}
+                for slot, (item, pending, uncached_entities, cached_results) in enumerate(to_call):
+                    detector = detectors[slot]  # slot < concurrency always -- no two calls share an instance
+                    context = {
+                        "language_detected": item["language_detected"],
+                        "script": item["script"],
+                        "source_type": item["source_type"],
+                    }
+                    future = pool.submit(detector.detect, item["text"], uncached_entities, context=context)
+                    futures[future] = (item, pending, uncached_entities, cached_results, detector)
+
+                try:
+                    # as_completed, not futures.items() -- see
+                    # extract_entities.py's identical fix: blocking in
+                    # submission order let one slow call stall writing back
+                    # every other already-finished result in the same batch.
+                    for future in as_completed(futures):
+                        item, pending, uncached_entities, cached_results, detector = futures[future]
+                        try:
+                            detected = future.result()
+                        except (GeminiFreeTierError, GeminiBillingExhaustedError, GeminiDailyQuotaExhaustedError):
+                            raise  # systemic -- stop the whole run, see outer except
+                        except Exception as item_error:  # noqa: BLE001 -- deliberately broad: isolate one item's failure (e.g. a 503 that outlasted every retry) from crashing the whole run
+                            # Leave it unscored so a later run retries it
+                            # naturally; log it and move on.
+                            stats.failed_items.append((item["item_id"], str(item_error)[:200]))
+                            continue
+                        stats.api_calls += 1
+                        if detector.last_usage_tokens is not None:  # type: ignore[attr-defined]
+                            cost_tracker.add(*detector.last_usage_tokens)  # type: ignore[attr-defined]
+                            detector.last_usage_tokens = None  # type: ignore[attr-defined]
+
+                        if not detected:
+                            stats.empty_response_items.append((item["item_id"], (item["text"] or "")[:80]))
+
+                        by_id = {r.entity_id: r for r in detected}
+                        new_results: dict[str, StanceResult] = {}
+                        for e in uncached_entities:
+                            result = by_id.get(e.entity_id)
+                            if result is None:
+                                # Model omitted this entity -- fall back to a
+                                # zero-confidence neutral edge rather than
+                                # dropping the pair silently.
+                                result = StanceResult(entity_id=e.entity_id, polarity="neutral", strength=0.0, confidence=0.0)
+                                stats.detection_gaps.append((item["item_id"], e.entity_id, e.canonical_name))
+                            stance_storage.store_stance_cache(con, item["text_hash"], result, model=model)
+                            new_results[e.entity_id] = result
+                        stats.pairs_from_api += len(uncached_entities)
+
+                        all_results = {**cached_results, **new_results}
+                        _finalize_item(con, item, pending, all_results, stats, skip_neutral, model)
+                except (GeminiFreeTierError, GeminiBillingExhaustedError, GeminiDailyQuotaExhaustedError) as e:
+                    stats.stopped_early_reason = f"Gemini fatal error: {e}"
+                    raise
+
+            time.sleep(BATCH_SLEEP_SECONDS)
+
+            # Threshold-based, not modulo -- see extract_entities.py's
+            # identical fix: batch size (concurrency) and PROGRESS_EVERY
+            # don't generally share a common divisor, which silently
+            # suppressed progress output for an entire run in practice.
+            if stats.items_considered - last_progress_print >= PROGRESS_EVERY or stats.items_considered == len(items):
+                print(f"[detect_stance] {cost_tracker.progress_line(stats.items_considered, total_remaining)}", flush=True)
+                last_progress_print = stats.items_considered
+
+    return stats, con, cost_tracker
 
 
 def print_examples(con: duckdb.DuckDBPyConnection) -> None:
@@ -292,23 +424,8 @@ def print_examples(con: duckdb.DuckDBPyConnection) -> None:
     else:
         print("  (none found in this batch)")
 
-    print("\n--- Additional example items ---")
-    other_item_ids = [
-        r[0]
-        for r in con.execute(
-            f"""
-            SELECT DISTINCT item_id FROM entity_stance_edges
-            WHERE item_id NOT IN ({", ".join("?" for _ in mixed_item_ids + hi_ur_item_ids) or "NULL"})
-            LIMIT 2
-            """,
-            mixed_item_ids + hi_ur_item_ids,
-        ).fetchall()
-    ]
-    if other_item_ids:
-        fetch_item_examples(other_item_ids)
 
-
-def print_report(stats: RunStats, con: duckdb.DuckDBPyConnection) -> None:
+def print_report(stats: RunStats, con: duckdb.DuckDBPyConnection, cost_tracker: CostTracker) -> None:
     print("\n--- Stance detection summary ---")
     print(f"Items processed: {stats.items_considered}")
     print(f"Actual API calls made: {stats.api_calls}")
@@ -317,6 +434,9 @@ def print_report(stats: RunStats, con: duckdb.DuckDBPyConnection) -> None:
     print(f"(item, entity) pairs from API: {stats.pairs_from_api}")
     print(f"Edges written: {stats.edges_written}")
     print(f"Edges skipped (--skip-neutral-edges): {stats.skipped_neutral}")
+    print(f"Total cost this run: ${cost_tracker.total_cost:.4f} ({cost_tracker.calls} billed calls)")
+    if stats.stopped_early_reason:
+        print(f"Stopped early: {stats.stopped_early_reason}")
 
     print("\nPolarity breakdown (all pairs decided, including any skipped):")
     for polarity in ("positive", "negative", "neutral"):
@@ -327,24 +447,28 @@ def print_report(stats: RunStats, con: duckdb.DuckDBPyConnection) -> None:
     print(f"\nTotal entity_stance_edges (all-time): {row[0]}")
 
     print(f"\nDetection gaps (model omitted an entity from its response, filled with neutral/0-confidence): {len(stats.detection_gaps)}")
-    for item_id, entity_id, canonical_name in stats.detection_gaps:
+    for item_id, entity_id, canonical_name in stats.detection_gaps[:15]:
         print(f"  item={item_id} entity={canonical_name!r} ({entity_id[:8]}...)")
 
     print(f"\nItems where the API call returned NOTHING (stance detection failed): {len(stats.empty_response_items)}")
-    for item_id, snippet in stats.empty_response_items:
+    for item_id, snippet in stats.empty_response_items[:15]:
         print(f"  {item_id}: {snippet!r}")
+
+    print(f"\nItems that failed (retries exhausted, skipped -- will retry next run): {len(stats.failed_items)}")
+    for item_id, error in stats.failed_items[:15]:
+        print(f"  {item_id}: {error!r}")
 
     print_examples(con)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stance detection (docs/analysis_layer_spec.md §4 pass 2)")
-    parser.add_argument("--limit", type=int, default=50, help="Max items to process this run")
+    parser.add_argument("--limit", type=int, default=None, help="Max items to process this invocation (default: no cap)")
     parser.add_argument(
         "--clusters-only",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Restrict to items in coordination clusters (default: true)",
+        help="Restrict to items in coordination clusters (default: true). --no-clusters-only processes all pending items, cluster items first.",
     )
     parser.add_argument(
         "--skip-neutral-edges",
@@ -352,14 +476,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Drop polarity=neutral edges at write time instead of persisting them (default: false, keep everything)",
     )
+    parser.add_argument("--provider", choices=["anthropic", "gemini"], default="anthropic", help="Which StanceDetector implementation to use")
+    parser.add_argument("--max-cost", type=float, default=None, help="Stop cleanly once estimated spend exceeds this USD amount")
+    parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help=f"Concurrent API calls in flight (default: {DEFAULT_CONCURRENCY})")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    detector = AnthropicStanceDetector(api_key=config.ANTHROPIC_API_KEY, model=config.ANTHROPIC_MODEL)
-    stats, con = run(args.clusters_only, args.limit, args.skip_neutral_edges, detector)
-    print_report(stats, con)
+    if args.provider == "gemini":
+        api_key, model = config.get_gemini_api_key(), config.GEMINI_MODEL
+    else:
+        api_key, model = config.ANTHROPIC_API_KEY, config.ANTHROPIC_MODEL
+    detectors = build_detector_pool(args.provider, api_key=api_key, model=model, size=args.concurrency)
+    cost_tracker = CostTracker(provider=args.provider, max_cost=args.max_cost)
+    stats, con, cost_tracker = run(args.clusters_only, args.limit, args.skip_neutral_edges, detectors, model, cost_tracker)
+    print_report(stats, con, cost_tracker)
     con.close()
 
 

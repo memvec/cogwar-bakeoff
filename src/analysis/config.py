@@ -44,3 +44,42 @@ ANALYSIS_DB_PATH = ANALYSIS_DATA_PATH / "analysis.duckdb"
 SEED_ENTITIES_PATH = Path("configs/seed_entities.json")
 
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
+
+# Gemini is an alternative provider behind the same swappable interfaces
+# (entities.EntityExtractor / stance.StanceDetector) -- optional at import
+# time, unlike ANTHROPIC_API_KEY above, because anthropic remains the
+# default provider and nothing that only uses it should be forced to
+# configure Gemini too. get_gemini_api_key() below is where this fails
+# loud, the moment something actually tries to select "gemini".
+GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY")
+
+# Gemini Flash model id. Both 3.6-flash and 3.7-flash hit this project's
+# generate_requests_per_model_per_day quota (10,000/day) on 2026-08-22 --
+# quotas are tracked per MODEL, so heavy usage on one doesn't affect the
+# other's bucket, but a big enough corpus run saturates each in turn.
+# 3.6-flash's bucket had the most time to age out as of 2026-08-23 05:5x IST
+# (confirmed via a 25-call burst test, 0 failures) while 3.7-flash was still
+# fully exhausted at the same check -- so 3.6-flash is the active choice
+# again for now. Keep checking both if this one saturates too (verified
+# against ai.google.dev/gemini-api/docs/pricing as of 2026-08).
+GEMINI_MODEL = "gemini-3.6-flash"
+
+
+def get_gemini_api_key() -> str:
+    """Fail loud only when Gemini is actually selected as a provider.
+
+    IMPORTANT: use a PAID-TIER Gemini API key. Google's free tier trains on
+    submitted data by default -- unacceptable here, since this pipeline's
+    content is real (if public) account text. Enable billing on the
+    AI Studio / Cloud project the key comes from before using it.
+    """
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "Missing required environment variable: GEMINI_API_KEY.\n"
+            "Create a .env entry with a PAID-TIER Gemini API key from "
+            "https://aistudio.google.com/apikey -- confirm billing is enabled on "
+            "that project first; a free-tier key trains on submitted data, which "
+            "is not acceptable for this pipeline's content.\n"
+            "Then try again."
+        )
+    return GEMINI_API_KEY

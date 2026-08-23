@@ -19,6 +19,8 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from analysis.gemini_retry import call_with_retry
+
 # Per the spec's stance ontology (§1.4). "neutral" also covers incidental/
 # factual mentions with no real evaluative stance -- the most common case.
 POLARITIES = ("positive", "negative", "neutral")
@@ -42,6 +44,14 @@ class StanceResult:
     confidence: float
 
 
+# Locked product decision (not a model default): conservative quote
+# attribution. A quoted/reported/attributed statement is NOT counted as the
+# author's own stance unless they clearly endorse it -- this deliberately
+# trades some recall for a lower false-positive rate (an author who merely
+# relays someone else's claim must not be scored as if they asserted it
+# themselves). See the "CONSERVATIVE QUOTE ATTRIBUTION" paragraph below.
+# Shared by both AnthropicStanceDetector and GeminiStanceDetector (both call
+# _build_user_prompt/_SYSTEM_PROMPT unchanged), so this is one edit, not two.
 _SYSTEM_PROMPT = """You are a stance detection system for a coordinated-inauthentic-behavior \
 (CIB) detection pipeline. The content you analyze is social media text in Hindi, Urdu, English, \
 and code-mixed combinations of these -- spanning Devanagari script, Arabic/Nastaliq script (Urdu), \
@@ -55,6 +65,17 @@ entity, independently determine the STANCE THE AUTHOR of the text takes toward t
 An author can hold opposite stances toward different entities in the same text -- e.g. praising one \
 country while condemning another, or defending one leader while attacking a rival. Judge each entity \
 strictly on its own terms; do not let the stance toward one entity bleed into your read of another.
+
+CONSERVATIVE QUOTE ATTRIBUTION -- read carefully: the author's stance is what THEY assert in their \
+OWN VOICE. If the text is reporting, quoting, or attributing a statement or view to someone else \
+(e.g. "X said...", "according to Y...", a news-style relay of someone else's claim, a screenshot or \
+repost of another person's post) WITHOUT the author clearly endorsing it themselves, that quoted or \
+reported view is NOT the author's own stance toward the entities it concerns -- score those entities \
+neutral. Only attribute positive/negative stance to the author when the author's OWN framing, \
+editorializing, or added commentary clearly signals agreement or disagreement with what's being \
+relayed. Merely reporting that a statement was made, or who made it, is not evidence of the author's \
+own stance -- when in doubt between "the author's own voice" and "the author is just the messenger," \
+prefer neutral.
 
 For each entity, report:
 - "polarity": one of "positive", "negative", "neutral". "neutral" covers incidental or purely \
@@ -171,6 +192,10 @@ class AnthropicStanceDetector(StanceDetector):
         self._client = anthropic.Anthropic(api_key=api_key)
         self._model = model
         self._max_tokens = max_tokens
+        # (input_tokens, output_tokens) from the most recent detect() call --
+        # same shape as GeminiStanceDetector's, so callers (cost tracking in
+        # detect_stance.py) can read it uniformly regardless of provider.
+        self.last_usage_tokens: tuple[int, int] | None = None
 
     def detect(
         self, text: str, entities: list[EntityRef], context: dict | None = None
@@ -183,5 +208,78 @@ class AnthropicStanceDetector(StanceDetector):
             system=_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": _build_user_prompt(text, entities, context)}],
         )
+        self.last_usage_tokens = (response.usage.input_tokens, response.usage.output_tokens)
         raw = "".join(block.text for block in response.content if block.type == "text")
         return _parse_response(raw, entities)
+
+
+class GeminiStanceDetector(StanceDetector):
+    """Detects per-entity stance via the Gemini API.
+
+    Same prompt (_SYSTEM_PROMPT / _build_user_prompt) and same response
+    parsing (_parse_response) as AnthropicStanceDetector -- only the API
+    call differs, so a head-to-head comparison (analysis/compare_providers.py)
+    is comparing the MODELS, not different prompting strategies.
+    """
+
+    def __init__(self, api_key: str, model: str, max_tokens: int = 2048) -> None:
+        from google import genai
+        from google.genai import types
+
+        # Explicit per-request timeout -- see entities.GeminiEntityExtractor
+        # for why: a genuine network hang (no response, no exception to
+        # retry on) isn't caught by gemini_retry.py's retry logic and was
+        # observed stalling a run for 15+ minutes with connections open at
+        # 0% CPU. Bounding it here turns that into a normal timeout the
+        # per-item failure handling already knows how to skip.
+        self._client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=180_000))
+        self._model = model
+        # See entities.GeminiEntityExtractor -- Gemini 3.x Flash spends part
+        # of max_output_tokens on internal "thoughts" before visible text.
+        self._max_tokens = max_tokens
+        # Diagnostic only -- NOT part of the StanceDetector interface
+        # contract. Set after every detect() call so cost tracking can use
+        # real token usage without a second, wasted API call.
+        self.last_usage_tokens: tuple[int, int] | None = None
+
+    def detect(
+        self, text: str, entities: list[EntityRef], context: dict | None = None
+    ) -> list[StanceResult]:
+        if not text or not text.strip() or not entities:
+            return []
+        from google.genai import types
+
+        response = call_with_retry(
+            lambda: self._client.models.generate_content(
+                model=self._model,
+                contents=_build_user_prompt(text, entities, context),
+                config=types.GenerateContentConfig(
+                    system_instruction=_SYSTEM_PROMPT,
+                    max_output_tokens=self._max_tokens,
+                ),
+            )
+        )
+        usage = response.usage_metadata
+        self.last_usage_tokens = (
+            (usage.prompt_token_count or 0) if usage else 0,
+            ((usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)) if usage else 0,
+        )
+        return _parse_response(response.text or "", entities)
+
+
+def build_detector(provider: str, api_key: str, model: str) -> StanceDetector:
+    """Provider-selection factory: construct the StanceDetector implementation
+    named by `provider` ("anthropic" or "gemini"). Mirrors
+    entities.build_extractor -- see that docstring."""
+    if provider == "anthropic":
+        return AnthropicStanceDetector(api_key=api_key, model=model)
+    if provider == "gemini":
+        return GeminiStanceDetector(api_key=api_key, model=model)
+    raise ValueError(f"Unknown provider: {provider!r} (expected 'anthropic' or 'gemini')")
+
+
+def build_detector_pool(provider: str, api_key: str, model: str, size: int) -> list[StanceDetector]:
+    """`size` independent instances, for safe concurrent use across worker
+    threads -- mirrors entities.build_extractor_pool; see that docstring for
+    why sharing one instance across threads is unsafe (last_usage_tokens)."""
+    return [build_detector(provider, api_key=api_key, model=model) for _ in range(size)]

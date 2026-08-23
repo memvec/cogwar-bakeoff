@@ -27,12 +27,17 @@ threshold constants below for the actual scores that drove these numbers):
   auto-merging -- this is intentional, not a gap: the LLM tier is the
   guard, per the design brief.
 
-  Tier 2 -- LLM adjudication, cost-bearing but rare (only candidates in the
-  ambiguous band reach it). Asks the model, given each entity's aliases and
+  Tier 2 -- LLM adjudication, LOCAL ONLY (Ollama, see adjudicate_local),
+  cost-free but not instant. Asks the model, given each entity's aliases and
   one real sample mention apiece, whether they're the same real-world
   entity. This is what catches "these are actually different people who
   happen to share a name fragment" -- something no string-similarity
-  threshold can determine on its own.
+  threshold can determine on its own. Locked local-only 2026-08-23: at
+  full-corpus scale (~9,600 entities) even a well-tuned CANDIDATE_THRESHOLD
+  leaves thousands of pairs needing adjudication, and paying per-call API
+  rates for that volume with no cap is real, uncapped money -- see
+  DEFAULT_LOCAL_MODEL's docstring for the model choice and why (qwen3:8b's
+  "thinking" mode was ~20x too slow for this volume).
 
 Idempotent: every pair decision (merged or rejected) is persisted to
 entity_merge_decisions. A merged pair can never be re-found (one side no
@@ -79,12 +84,23 @@ CREATE TABLE IF NOT EXISTS entity_merge_log (
 """
 
 # Candidate generation: below this best-cross-pair token_set_ratio, two
-# entities aren't considered related at all. Calibrated so real adversarial
-# pairs ("Ali Khan" vs "Imran Khan" = 66.7, "Fawad Chaudhry" vs "Pervez
-# Chaudhry" = 72.7) still clear it and get a real LLM adjudication rather
-# than being silently dropped -- false negatives here are worse than a few
-# extra cheap LLM calls.
-CANDIDATE_THRESHOLD = 65.0
+# entities aren't considered related at all.
+#
+# Originally 65.0, calibrated at ~94-entity scale so adversarial pairs
+# ("Ali Khan" vs "Imran Khan" = 66.7, "Fawad Chaudhry" vs "Pervez Chaudhry"
+# = 72.7) still cleared it. That calibration does NOT scale: at ~9,600
+# entities the O(n^2) same-type comparison is ~11.5M pairs, and even 65's
+# tiny pass rate (0.36%, observed 2026-08-23) produced 40,878 candidates --
+# nearly all single common words (e.g. "Kashmir") coincidentally scoring
+# 100 as a token-subset of dozens of unrelated longer names ("Nasha Mukt
+# Jammu and Kashmir Abhiyan"). Raised to 90.0: real fragmentation
+# ("Ali Mirza" is a token subset of "Engineer Muhammad Ali Mirza") still
+# scores ~100 and clears this easily, while the surname-coincidence
+# adversarial pairs above (66.7, 72.7) now fall below it -- an acceptable
+# loss since those were always going to be LLM-rejected anyway, never a
+# real merge. This threshold is corpus-size-sensitive; re-check the score
+# distribution before reusing it at a very different entity count.
+CANDIDATE_THRESHOLD = 90.0
 
 # Auto-merge: plain (non-token) ratio of the two canonical_name strings.
 # Deliberately conservative and deliberately NOT token_set_ratio -- the
@@ -213,23 +229,46 @@ def get_sample_mention(con: duckdb.DuckDBPyConnection, entity_id: str) -> str | 
     return row[0][:200]
 
 
-def adjudicate(
-    client, model: str, con: duckdb.DuckDBPyConnection, a: EntityRecord, b: EntityRecord
+# Local-only Tier 2 (locked 2026-08-23): at ~9,600-entity scale even the
+# recalibrated CANDIDATE_THRESHOLD leaves thousands of pairs needing
+# adjudication -- paying per-call API rates for that volume is real money
+# with no cap, so this pass runs entirely against a local Ollama model
+# instead. qwen3:8b (a "thinking" model) took ~43s/call on this task --
+# unusable at this volume; qwen2.5:3b-instruct answers the same conservative
+# same-entity judgment in ~2s once warm, which is what makes a few thousand
+# candidates tractable in a single run.
+DEFAULT_LOCAL_MODEL = "qwen2.5:3b-instruct"
+
+
+def adjudicate_local(
+    model: str, con: duckdb.DuckDBPyConnection, a: EntityRecord, b: EntityRecord
 ) -> tuple[bool, float, str]:
-    """Ask the LLM whether `a` and `b` are the same real-world entity. Malformed output is treated as a rejection (fail closed, never auto-merge on a parse failure)."""
+    """Ask a local Ollama model whether `a` and `b` are the same real-world
+    entity. Malformed output OR a request-level failure (e.g. Ollama not
+    running) is treated as a rejection -- fail closed, never auto-merge on
+    a parse failure, same discipline as the original Anthropic-backed
+    adjudicate() this replaces.
+    """
+    import ollama
+
     prompt = (
         f"Entity A:\n  canonical_name: {a.canonical_name}\n  aliases: {a.aliases}\n"
         f'  sample mention: "{get_sample_mention(con, a.entity_id)}"\n\n'
         f"Entity B:\n  canonical_name: {b.canonical_name}\n  aliases: {b.aliases}\n"
         f'  sample mention: "{get_sample_mention(con, b.entity_id)}"'
     )
-    response = client.messages.create(
-        model=model,
-        max_tokens=300,
-        system=ADJUDICATION_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = "".join(block.text for block in response.content if block.type == "text").strip()
+    try:
+        response = ollama.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": ADJUDICATION_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw = response["message"]["content"].strip()
+    except Exception as e:  # noqa: BLE001 -- local inference failure (Ollama down, model missing, etc.) must not crash the run; fail closed like a parse failure
+        return False, 0.0, f"local adjudication request failed -- fail closed, treated as reject: {e}"
+
     if raw.startswith("```"):
         raw = raw.strip("`").removeprefix("json").strip()
     try:
@@ -317,9 +356,11 @@ def merge_entities(
     )
 
 
-def run(client=None, model: str | None = None) -> tuple[MergeStats, duckdb.DuckDBPyConnection]:
+def run(ollama_model: str = DEFAULT_LOCAL_MODEL, progress_every: int = 100) -> tuple[MergeStats, duckdb.DuckDBPyConnection]:
+    """Tier 2 runs entirely against a local Ollama model (see
+    adjudicate_local's docstring for why) -- no Anthropic dependency, no
+    API cost, no rate limits, for this pass."""
     con = connect()
-    model = model or config.ANTHROPIC_MODEL
 
     entities = load_entities(con)
 
@@ -327,10 +368,14 @@ def run(client=None, model: str | None = None) -> tuple[MergeStats, duckdb.DuckD
     stats = MergeStats()
     stats.before_count = len(entities)
     stats.candidates = len(candidates)
+    print(f"[merge] candidate pairs to evaluate: {len(candidates)} (local model: {ollama_model})", flush=True)
 
     live_ids = set(entities.keys())  # tracks what's still alive as we merge within this run
 
-    for a, b, score in candidates:
+    for i, (a, b, score) in enumerate(candidates, start=1):
+        if i % progress_every == 0:
+            print(f"[merge] progress: {i}/{len(candidates)} evaluated -- {stats.auto_merged} auto-merged, {stats.llm_confirmed} confirmed, {stats.llm_rejected} rejected", flush=True)
+
         if a.entity_id not in live_ids or b.entity_id not in live_ids:
             continue  # one side already merged away earlier in this same run
 
@@ -348,13 +393,9 @@ def run(client=None, model: str | None = None) -> tuple[MergeStats, duckdb.DuckD
             stats.log.append(line)
             continue
 
-        # Ambiguous band -- Tier 2.
-        if client is None:
-            import anthropic
-
-            client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        # Ambiguous band -- Tier 2, local only.
         stats.sent_to_llm += 1
-        same, confidence, reasoning = adjudicate(client, model, con, a, b)
+        same, confidence, reasoning = adjudicate_local(ollama_model, con, a, b)
 
         if same:
             survivor, merged = pick_survivor(a, b)

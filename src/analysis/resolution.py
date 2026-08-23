@@ -198,9 +198,15 @@ def get_cached_extraction(con: duckdb.DuckDBPyConnection, text_hash: str) -> lis
 def store_extraction_cache(
     con: duckdb.DuckDBPyConnection, text_hash: str, mentions: list[EntityMention], model: str
 ) -> None:
+    """ON CONFLICT DO NOTHING: with concurrent processing (extract_entities.py
+    can dispatch several items per batch to the API pool at once), two
+    different items sharing the same text_hash can both miss the cache and
+    both fetch fresh -- a real, not-rare pattern (re-collected/duplicate
+    content) -- so the second writer here must not crash on the first
+    writer's already-inserted row for the same text_hash."""
     payload = json.dumps([dataclasses.asdict(m) for m in mentions])
     con.execute(
-        "INSERT INTO extraction_cache VALUES (?, ?, ?, ?)",
+        "INSERT INTO extraction_cache VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
         [text_hash, payload, datetime.now(UTC), model],
     )
 
