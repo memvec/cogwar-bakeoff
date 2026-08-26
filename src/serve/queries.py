@@ -214,7 +214,8 @@ def get_narrative(con: duckdb.DuckDBPyConnection, narrative_id: str) -> dict | N
     member_rows = con.execute(
         """
         SELECT nm.item_id, i.source_type || ':' || i.author_native_id AS author_id,
-               i.author_display_name, i.published_at, substr(i.text, 1, 200) AS text_snippet
+               i.author_display_name, i.published_at, substr(i.text, 1, 200) AS text_snippet,
+               i.source_type, i.source_specific, i.source_native_id
         FROM narrative_members nm
         JOIN processed.items i ON i.item_id = nm.item_id
         WHERE nm.narrative_id = ?
@@ -223,7 +224,15 @@ def get_narrative(con: duckdb.DuckDBPyConnection, narrative_id: str) -> dict | N
         [narrative_id],
     ).fetchall()
     members = [
-        {"item_id": r[0], "author_id": r[1], "author_display_name": r[2], "published_at": r[3], "text_snippet": r[4]}
+        {
+            "item_id": r[0],
+            "author_id": r[1],
+            "author_display_name": r[2],
+            "published_at": r[3],
+            "text_snippet": r[4],
+            "source_url": _build_source_url(r[5], r[6]),
+            "source_native_id": r[7],
+        }
         for r in member_rows
     ]
 

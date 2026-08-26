@@ -3,15 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Coordination Graph — CIB Analysis</title>
+<title>Signal — Coordination &amp; Narrative Analysis</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
 <header class="topbar">
   <div class="brand">
-    <h1>Coordination Graph</h1>
-    <p class="subtitle">Cross-author coordination signal, entity stance fingerprinting</p>
+    <span class="brand-mark">◆</span>
+    <span class="brand-name">Signal</span>
   </div>
   <div id="stats" class="stats-strip">
     <div class="stat"><span class="stat-value">—</span><span class="stat-label">items</span></div>
@@ -22,37 +22,39 @@
   </div>
 </header>
 
-<main class="layout">
-  <section class="graph-panel">
-    <div class="controls">
-      <div class="control-group">
-        <label for="minEdges">Min shared edges per author pair</label>
-        <div class="slider-row">
-          <input type="range" id="minEdges" min="1" max="30" value="5" step="1">
-          <span id="minEdgesValue" class="slider-value">5</span>
-        </div>
-      </div>
-      <div class="legend">
-        <div class="legend-item"><span class="swatch swatch-telegram"></span>Telegram</div>
-        <div class="legend-item"><span class="swatch swatch-youtube"></span>YouTube</div>
-        <div class="legend-item"><span class="swatch swatch-edge"></span>Shared content</div>
-        <div class="legend-item"><span class="swatch swatch-edge-temporal"></span>+ Temporal cocluster</div>
-      </div>
-    </div>
-    <div class="graph-canvas">
-      <svg id="graph"></svg>
-      <div id="graphStatus" class="graph-status"></div>
-    </div>
-    <div id="tooltip" class="tooltip hidden"></div>
-  </section>
+<section class="hero">
+  <h1 class="hero-title">Ask about the coordination data</h1>
+  <p class="hero-subtitle">Plain-language questions over stance, coordination and narrative signal — every answer traces back to the real posts behind it.</p>
 
-  <aside id="sidePanel" class="side-panel">
-    <div class="empty-state">
-      <p>Click a node to reveal its stance fingerprint</p>
-      <p class="empty-hint">Entities ranked by |net stance| × volume, positive in green, negative in red.</p>
-    </div>
-  </aside>
+  <form id="askForm" class="ask-form" autocomplete="off">
+    <svg class="ask-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <circle cx="9" cy="9" r="6.5" stroke="currentColor" stroke-width="1.6"/>
+      <line x1="13.6" y1="13.6" x2="18" y2="18" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+    </svg>
+    <input id="askInput" type="text" placeholder="e.g. who is most anti-Pakistan?" spellcheck="false">
+    <button type="submit" id="askSubmit">
+      <span class="btn-label">Ask</span>
+      <span class="btn-spinner" aria-hidden="true"></span>
+    </button>
+  </form>
+
+  <div class="chips" id="exampleChips">
+    <button class="chip" type="button" data-q="Who is most anti-Pakistan?">Who is most anti-Pakistan?</button>
+    <button class="chip" type="button" data-q="Show coordination around Operation Sindoor">Show coordination around Operation Sindoor</button>
+    <button class="chip" type="button" data-q="What is Resonant News's stance on Pakistan?">What is Resonant News's stance on Pakistan?</button>
+  </div>
+
+  <button id="networkToggle" class="network-toggle" type="button">
+    Explore the full coordination network <span aria-hidden="true">→</span>
+  </button>
+</section>
+
+<main class="results-shell">
+  <nav id="breadcrumbs" class="breadcrumbs hidden"></nav>
+  <div id="resultsArea" class="results-area"></div>
 </main>
+
+<div id="tooltip" class="tooltip hidden"></div>
 
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <script src="app.js"></script>
