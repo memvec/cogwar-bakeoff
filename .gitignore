@@ -32,3 +32,5 @@ results/*.json
 # OS / editor
 .DS_Store
 .vscode/
+data/analysis/
+*.duckdb
