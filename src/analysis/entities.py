@@ -206,18 +206,66 @@ class GeminiEntityExtractor(EntityExtractor):
         return _parse_response(response.text or "")
 
 
+class OllamaEntityExtractor(EntityExtractor):
+    """Extracts + resolves entity mentions via a local Ollama model.
+
+    Same prompt (_SYSTEM_PROMPT / _build_user_prompt) and same response
+    parsing (_parse_response) as AnthropicEntityExtractor/GeminiEntityExtractor
+    -- only the call differs, same reasoning as GeminiEntityExtractor's
+    docstring: a head-to-head comparison is comparing MODELS, not prompting
+    strategies. No API key, no network egress, no cost.
+    """
+
+    #: Hard cap on generated tokens, same role as AnthropicEntityExtractor's
+    #: max_tokens/GeminiEntityExtractor's max_output_tokens -- confirmed for
+    #: real that omitting this is dangerous: a local model can drop into a
+    #: degenerate repetition loop and grind on with no natural stop
+    #: condition, observed for real as a single call running 17+ minutes
+    #: (vs. a normal few seconds to ~1 minute) before being killed. The
+    #: expected output here is a short JSON array, nowhere near this cap in
+    #: the normal case.
+    _MAX_OUTPUT_TOKENS = 1024
+
+    def __init__(self, model: str, api_key: str | None = None) -> None:
+        # api_key accepted (and ignored) only so this fits build_extractor's
+        # shared (provider, api_key, model) factory signature alongside the
+        # cloud providers -- Ollama is local, nothing to authenticate.
+        self._model = model
+        # Always None: there's no token-usage/cost concept for a local
+        # model, and callers (extract_entities.py's cost tracking) already
+        # guard on `is not None` before touching a CostTracker.
+        self.last_usage_tokens: tuple[int, int] | None = None
+
+    def extract(self, text: str, context: dict | None = None) -> list[EntityMention]:
+        if not text or not text.strip():
+            return []
+        import ollama
+
+        response = ollama.chat(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": _build_user_prompt(text, context)},
+            ],
+            options={"num_predict": self._MAX_OUTPUT_TOKENS},
+        )
+        return _parse_response(response["message"]["content"])
+
+
 def build_extractor(provider: str, api_key: str, model: str) -> EntityExtractor:
     """Provider-selection factory: construct the EntityExtractor implementation
-    named by `provider` ("anthropic" or "gemini"). The swap boundary is the
-    ABC above; this is just a convenience so callers don't hardcode a class
-    name -- callers own reading api_key/model out of config for whichever
-    provider they picked.
+    named by `provider` ("anthropic", "gemini", or "ollama"). The swap
+    boundary is the ABC above; this is just a convenience so callers don't
+    hardcode a class name -- callers own reading api_key/model out of config
+    for whichever provider they picked (api_key is ignored for "ollama").
     """
     if provider == "anthropic":
         return AnthropicEntityExtractor(api_key=api_key, model=model)
     if provider == "gemini":
         return GeminiEntityExtractor(api_key=api_key, model=model)
-    raise ValueError(f"Unknown provider: {provider!r} (expected 'anthropic' or 'gemini')")
+    if provider == "ollama":
+        return OllamaEntityExtractor(model=model)
+    raise ValueError(f"Unknown provider: {provider!r} (expected 'anthropic', 'gemini', or 'ollama')")
 
 
 def build_extractor_pool(provider: str, api_key: str, model: str, size: int) -> list[EntityExtractor]:

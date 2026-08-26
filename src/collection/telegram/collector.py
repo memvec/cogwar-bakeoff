@@ -382,11 +382,34 @@ async def collect_and_persist_all(
     Takes an already-started `client` rather than owning its lifecycle, so
     it can be tested with a stub client and a monkeypatched collect_channel
     -- no real Telethon connection required.
+
+    Same-run dedup by resolved channel_key: `handles` can name the same
+    channel twice under different spellings -- a seed CSV entry that's an
+    @handle string discovered by a PRIOR run's forward-mining, plus a raw
+    numeric channel_id THIS run's own mine_forward_target_channel_ids just
+    rediscovered (it only excludes channels with an existing checkpoint,
+    and it runs once at the very start of main(), before any of this run's
+    own collecting has set one). We can't detect the collision until after
+    resolving the handle (channel_key = entity.id is only known post-
+    resolution), so the wasted API calls for a repeat aren't avoidable
+    here -- but persisting it twice under the same file_key would crash
+    (writers.py's write-once guard, correctly refusing to silently
+    overwrite), so skip the second persist rather than let that happen.
     """
+    seen_channel_keys: set[str] = set()
     for handle in handles:
         result = await collect_channel(client, handle, run_id, max_per_channel, months, stats)
         if result is None:
             continue
+
+        if result.channel_key in seen_channel_keys:
+            print(
+                f"[collector] {handle}: skipping -- channel {result.channel_key} already "
+                "collected earlier in this run under a different handle",
+                flush=True,
+            )
+            continue
+        seen_channel_keys.add(result.channel_key)
 
         persist_channel_result(result, run_id)
 

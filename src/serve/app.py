@@ -12,18 +12,22 @@ from typing import Annotated
 import duckdb
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
+from serve import ask as ask_module
 from serve import queries
+from serve import resolve as resolve_module
 from serve.db import get_connection
 
 app = FastAPI(title="cogwar-bakeoff analysis API")
 
 # Frontend is a separate origin during dev and unauthenticated for now --
-# open CORS is fine for a backend-only, no-auth-yet viz API.
+# open CORS is fine for a backend-only, no-auth-yet viz API. POST is needed
+# for /api/ask (the only endpoint that isn't a pure query-string GET).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -72,8 +76,15 @@ def author_profile(
 
 
 @app.get("/api/entity/{entity_id}/authors")
-def entity_authors(con: Conn, entity_id: str, limit: int = Query(10, ge=1, le=500)) -> dict:
-    result = queries.get_entity_authors(con, entity_id, limit)
+def entity_authors(
+    con: Conn,
+    entity_id: str,
+    limit: int = Query(10, ge=1, le=500),
+    min_volume: int = Query(
+        5, ge=1, description="Exclude authors with fewer than this many stance-bearing items toward the entity -- filters out volume=1 scoring flukes"
+    ),
+) -> dict:
+    result = queries.get_entity_authors(con, entity_id, limit, min_volume)
     if result is None:
         raise HTTPException(404, f"entity not found: {entity_id}")
     return result
@@ -93,3 +104,63 @@ def narrative(con: Conn, narrative_id: str) -> dict:
     if result is None:
         raise HTTPException(404, f"narrative not found: {narrative_id}")
     return result
+
+
+@app.get("/api/author/{author_id}/entity/{entity_id}/sources")
+def author_entity_sources(
+    con: Conn,
+    author_id: str,
+    entity_id: str,
+    limit: int = Query(20, ge=1, le=500, description="Max source items to return, most recent first"),
+) -> dict:
+    result = queries.get_author_entity_sources(con, author_id, entity_id, limit)
+    if result is None:
+        raise HTTPException(404, f"no data for author={author_id!r} entity={entity_id!r}")
+    return result
+
+
+@app.get("/api/cluster/{cluster_id}/items")
+def cluster_items(con: Conn, cluster_id: str) -> dict:
+    """`cluster_id` is any item_id known to be part of the cluster -- see
+    queries.get_cluster_items for why there's no separate stable cluster id
+    yet."""
+    result = queries.get_cluster_items(con, cluster_id)
+    if result is None:
+        raise HTTPException(404, f"item not found: {cluster_id}")
+    return result
+
+
+@app.get("/api/item/{item_id}")
+def item_detail(con: Conn, item_id: str) -> dict:
+    result = queries.get_item_detail(con, item_id)
+    if result is None:
+        raise HTTPException(404, f"item not found: {item_id}")
+    return result
+
+
+@app.get("/api/resolve")
+def resolve_name(
+    con: Conn,
+    kind: str = Query(..., pattern="^(entity|author)$", description="'entity' or 'author'"),
+    name: str = Query(..., min_length=1),
+) -> dict:
+    result = resolve_module.resolve_entity(con, name) if kind == "entity" else resolve_module.resolve_author(con, name)
+    if result is None:
+        raise HTTPException(404, f"no {kind} match for {name!r}")
+    return result
+
+
+class AskRequest(BaseModel):
+    question: str
+
+
+@app.post("/api/ask")
+def ask(con: Conn, body: AskRequest) -> dict:
+    result = ask_module.answer(con, body.question)
+    return {
+        "question": result.question,
+        "intent": result.intent,
+        "result": result.result,
+        "summary": result.summary,
+        "error": result.error,
+    }

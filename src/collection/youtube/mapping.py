@@ -77,6 +77,23 @@ def _pick_best_thumbnail_url(thumbnails: dict) -> str | None:
     return None
 
 
+def extract_video_id_from_url(url: str) -> str | None:
+    """youtube.com/watch?v=... or youtu.be/... -> the video id, else None.
+
+    Shared by build_mention_edges (description links) and collector.py's
+    channel-ref resolution (an evidence video URL -> its channel, via
+    videos.list) -- same regex, one definition.
+    """
+    match = _YOUTUBE_VIDEO_RE.search(url)
+    return match.group(1) if match else None
+
+
+def extract_channel_id_from_url(url: str) -> str | None:
+    """youtube.com/channel/UC... -> the channel id, else None."""
+    match = _YOUTUBE_CHANNEL_RE.search(url)
+    return match.group(1) if match else None
+
+
 def build_video_item(
     video: dict,
     channel_item_id: uuid.UUID,
@@ -212,12 +229,12 @@ def build_mention_edges(
         )
     for url in entities.get("urls", []):
         dst_item_id = None
-        video_match = _YOUTUBE_VIDEO_RE.search(url)
-        channel_match = _YOUTUBE_CHANNEL_RE.search(url)
-        if video_match:
-            dst_item_id = video_lookup.get(video_match.group(1))
-        elif channel_match:
-            dst_item_id = channel_lookup.get(channel_match.group(1))
+        video_id = extract_video_id_from_url(url)
+        channel_id = extract_channel_id_from_url(url)
+        if video_id:
+            dst_item_id = video_lookup.get(video_id)
+        elif channel_id:
+            dst_item_id = channel_lookup.get(channel_id)
         edges.append(
             Edge(
                 edge_type=EdgeType.mention,

@@ -1,0 +1,81 @@
+{
+  "_comment": "Editable multilingual keyword list for topic-relevance filtering (analysis/scope.py, docs/analysis_layer_spec.md scope pass). Matching is a case-insensitive substring check against each item's combined text (Telegram message text; YouTube title+description, already concatenated into `text` at collection time; plus transcript text where present) -- NOT a regex, so no need to escape special characters when adding entries, just add the literal phrase as it would appear in the text. This is deliberately high-precision/lower-recall: it will miss on-topic content that doesn't use one of these exact substrings. Expand freely as sample review turns up misses -- add more scripts, more transliterations, more synonyms/hashtags per topic, or whole new topic entries. Keep every keyword lowercase (or script-appropriate; non-Latin scripts have no case) since the matcher lowercases both sides.",
+  "topics": [
+    {
+      "topic": "Operation Sindoor",
+      "keywords": [
+        "operation sindoor",
+        "sindoor",
+        "सिंदूर",
+        "ऑपरेशन सिंदूर",
+        "آپریشن سیندور",
+        "pahalgam",
+        "पहलगाम",
+        "پہلگام"
+      ]
+    },
+    {
+      "topic": "Indus Waters Treaty",
+      "keywords": [
+        "indus waters treaty",
+        "indus water treaty",
+        "iwt",
+        "indus river",
+        "indus basin",
+        "सिंधु जल संधि",
+        "सिंधु",
+        "سندھ طاس معاہدہ",
+        "سندھ طاس",
+        "water treaty",
+        "water war"
+      ]
+    },
+    {
+      "topic": "Turkey-Saudi-Pakistan pact",
+      "keywords": [
+        "makkah pact",
+        "makkah defence pact",
+        "mecca pact",
+        "saudi-pakistan",
+        "saudi pakistan",
+        "turkey pakistan",
+        "turkey saudi pakistan",
+        "defence pact",
+        "defense pact",
+        "strategic mutual defence",
+        "mutual defence agreement"
+      ]
+    },
+    {
+      "topic": "Kashmir",
+      "keywords": [
+        "kashmir",
+        "जम्मू और कश्मीर",
+        "कश्मीर",
+        "کشمیر",
+        "iiojk",
+        "j&k",
+        "jammu and kashmir",
+        "pahalgam",
+        "पहलगाम",
+        "پہلگام"
+      ]
+    },
+    {
+      "topic": "India-Pakistan conflict",
+      "keywords": [
+        "india pakistan",
+        "indo-pak",
+        "indo pak",
+        "pak india",
+        "india-pakistan",
+        "line of control",
+        "भारत पाकिस्तान",
+        "بھارت پاکستان",
+        "پاکستان بھارت",
+        "pakistan india tension",
+        "india pakistan tension"
+      ]
+    }
+  ]
+}

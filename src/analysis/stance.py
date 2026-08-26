@@ -267,15 +267,59 @@ class GeminiStanceDetector(StanceDetector):
         return _parse_response(response.text or "", entities)
 
 
+class OllamaStanceDetector(StanceDetector):
+    """Detects per-entity stance via a local Ollama model.
+
+    Same prompt (_SYSTEM_PROMPT / _build_user_prompt, including the locked
+    conservative-quote-attribution instruction) and same response parsing
+    (_parse_response) as AnthropicStanceDetector/GeminiStanceDetector --
+    only the call differs. No API key, no network egress, no cost.
+    """
+
+    #: Hard cap on generated tokens -- see entities.OllamaEntityExtractor's
+    #: identical constant for why this matters: without it, a local model
+    #: stuck in a degenerate repetition loop has no natural stop condition
+    #: and can run for many minutes on what should be a short JSON array
+    #: response (confirmed for real: one call ran 17+ minutes before being
+    #: killed). Scaled up slightly from the extractor's cap since a stance
+    #: response has one array element per entity, so a many-entity item
+    #: needs more room.
+    _MAX_OUTPUT_TOKENS = 2048
+
+    def __init__(self, model: str, api_key: str | None = None) -> None:
+        # api_key accepted (and ignored) -- see entities.OllamaEntityExtractor.
+        self._model = model
+        self.last_usage_tokens: tuple[int, int] | None = None
+
+    def detect(
+        self, text: str, entities: list[EntityRef], context: dict | None = None
+    ) -> list[StanceResult]:
+        if not text or not text.strip() or not entities:
+            return []
+        import ollama
+
+        response = ollama.chat(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": _build_user_prompt(text, entities, context)},
+            ],
+            options={"num_predict": self._MAX_OUTPUT_TOKENS},
+        )
+        return _parse_response(response["message"]["content"], entities)
+
+
 def build_detector(provider: str, api_key: str, model: str) -> StanceDetector:
     """Provider-selection factory: construct the StanceDetector implementation
-    named by `provider` ("anthropic" or "gemini"). Mirrors
+    named by `provider` ("anthropic", "gemini", or "ollama"). Mirrors
     entities.build_extractor -- see that docstring."""
     if provider == "anthropic":
         return AnthropicStanceDetector(api_key=api_key, model=model)
     if provider == "gemini":
         return GeminiStanceDetector(api_key=api_key, model=model)
-    raise ValueError(f"Unknown provider: {provider!r} (expected 'anthropic' or 'gemini')")
+    if provider == "ollama":
+        return OllamaStanceDetector(model=model)
+    raise ValueError(f"Unknown provider: {provider!r} (expected 'anthropic', 'gemini', or 'ollama')")
 
 
 def build_detector_pool(provider: str, api_key: str, model: str, size: int) -> list[StanceDetector]:

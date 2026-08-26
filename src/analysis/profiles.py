@@ -172,7 +172,7 @@ class RankedAuthor:
 
 
 def query_entity_authors(
-    con: duckdb.DuckDBPyConnection, entity_id: str, limit: int = 10
+    con: duckdb.DuckDBPyConnection, entity_id: str, limit: int = 10, min_volume: int = 1
 ) -> tuple[list[RankedAuthor], list[RankedAuthor]]:
     """Output query #3 (§3.3): given an entity, who consistently pushes
     FOR it and who consistently pushes AGAINST it, ranked by
@@ -184,6 +184,15 @@ def query_entity_authors(
     cross-narrative agenda yet, whatever its consistency) -- returns
     (consistently_positive, consistently_negative), each already sorted
     best-first, empty when nothing clears that bar.
+
+    `min_volume` (default 1, i.e. no additional filtering beyond the
+    existing volume > 0) excludes authors below the threshold outright,
+    rather than relying on the score alone: a volume=1, consistency=1.0
+    author scores exactly 0 (ln(1)=0) same as every other zero-score
+    author, so when fewer than `limit` authors clear a positive score, ties
+    at score=0 fill the remaining slots in arbitrary (query-plan) order --
+    surfacing one-post flukes as "top actors". Raising min_volume removes
+    them from the candidate set entirely instead of relying on a tie-break.
     """
     rows = con.execute(
         """
@@ -191,10 +200,10 @@ def query_entity_authors(
             author_id, entity_id, net_stance, stance_consistency, volume, narrative_spread,
             abs(net_stance) * stance_consistency * ln(volume) * narrative_spread AS score
         FROM author_entity_profiles
-        WHERE entity_id = ? AND volume > 0
+        WHERE entity_id = ? AND volume >= ?
         ORDER BY score DESC
         """,
-        [entity_id],
+        [entity_id, min_volume],
     ).fetchall()
     ranked = [RankedAuthor(*r) for r in rows]
     positive = [r for r in ranked if r.net_stance > 0][:limit]

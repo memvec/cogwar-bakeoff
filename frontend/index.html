@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coordination Graph — CIB Analysis</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <h1>Coordination Graph</h1>
+    <p class="subtitle">Cross-author coordination signal, entity stance fingerprinting</p>
+  </div>
+  <div id="stats" class="stats-strip">
+    <div class="stat"><span class="stat-value">—</span><span class="stat-label">items</span></div>
+    <div class="stat"><span class="stat-value">—</span><span class="stat-label">authors</span></div>
+    <div class="stat"><span class="stat-value">—</span><span class="stat-label">entities</span></div>
+    <div class="stat"><span class="stat-value">—</span><span class="stat-label">stance edges</span></div>
+    <div class="stat"><span class="stat-value">—</span><span class="stat-label">coordination clusters</span></div>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="graph-panel">
+    <div class="controls">
+      <div class="control-group">
+        <label for="minEdges">Min shared edges per author pair</label>
+        <div class="slider-row">
+          <input type="range" id="minEdges" min="1" max="30" value="5" step="1">
+          <span id="minEdgesValue" class="slider-value">5</span>
+        </div>
+      </div>
+      <div class="legend">
+        <div class="legend-item"><span class="swatch swatch-telegram"></span>Telegram</div>
+        <div class="legend-item"><span class="swatch swatch-youtube"></span>YouTube</div>
+        <div class="legend-item"><span class="swatch swatch-edge"></span>Shared content</div>
+        <div class="legend-item"><span class="swatch swatch-edge-temporal"></span>+ Temporal cocluster</div>
+      </div>
+    </div>
+    <div class="graph-canvas">
+      <svg id="graph"></svg>
+      <div id="graphStatus" class="graph-status"></div>
+    </div>
+    <div id="tooltip" class="tooltip hidden"></div>
+  </section>
+
+  <aside id="sidePanel" class="side-panel">
+    <div class="empty-state">
+      <p>Click a node to reveal its stance fingerprint</p>
+      <p class="empty-hint">Entities ranked by |net stance| × volume, positive in green, negative in red.</p>
+    </div>
+  </aside>
+</main>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
 import duckdb
 
@@ -56,12 +56,8 @@ from analysis.gemini_retry import (
     GeminiFreeTierError,
 )
 
-# Pause between BATCHES (not per-call) -- courtesy pacing once concurrency
-# is already doing the real throughput work; retry/backoff (gemini_retry.py)
-# handles genuine rate-limit pushback.
-BATCH_SLEEP_SECONDS = 0.2
 PROGRESS_EVERY = 25
-DEFAULT_CONCURRENCY = 8
+DEFAULT_CONCURRENCY = 12
 
 _CLUSTER_EDGE_TYPES = ("near_duplicate_text", "shared_media", "temporal_cocluster")
 
@@ -156,6 +152,72 @@ def count_remaining_candidates(con: duckdb.DuckDBPyConnection, clusters_only: bo
     return row[0]
 
 
+
+
+
+def select_scoped_candidate_items(
+    con: duckdb.DuckDBPyConnection,
+    restrict_to_item_ids: set[str],
+    priority_item_ids: set[str],
+    limit: int | None,
+) -> list[dict]:
+    """Same shape/contract as select_candidate_items, but restricted to an
+    arbitrary item_id universe (e.g. analysis_scope's on-topic set) instead
+    of "the full corpus" or "corpus-wide coordination clusters", with an
+    independently-specified priority subset (e.g. on-topic items that are
+    ALSO in a >=N-author coordination cluster) instead of the generic
+    any-derived-edge cluster definition. Kept as a separate function rather
+    than folded into select_candidate_items/_candidate_query: the two
+    priority definitions are structurally different (one is a SQL join
+    against processed.edges, this one is a caller-supplied Python set), and
+    forcing them through one parameterization was messier than two small
+    functions sharing nothing but column names.
+    """
+    limit_clause = "LIMIT $limit" if limit is not None else ""
+    query = f"""
+        WITH scope_items AS (
+            SELECT UNNEST($scope_ids) AS item_id
+        ),
+        priority_items AS (
+            SELECT UNNEST($priority_ids) AS item_id
+        )
+        SELECT i.item_id, i.text, i.text_hash, i.language_detected, i.script, i.source_type
+        FROM processed.items i
+        JOIN scope_items sc ON i.item_id = sc.item_id
+        LEFT JOIN priority_items pr ON i.item_id = pr.item_id
+        LEFT JOIN item_extraction_status s ON i.item_id = s.item_id
+        WHERE i.text IS NOT NULL AND i.text_hash IS NOT NULL AND s.item_id IS NULL
+        ORDER BY CASE WHEN pr.item_id IS NOT NULL THEN 0 ELSE 1 END, i.item_id
+        {limit_clause}
+    """
+    params: dict[str, object] = {"scope_ids": list(restrict_to_item_ids), "priority_ids": list(priority_item_ids)}
+    if limit is not None:
+        params["limit"] = limit
+    rows = con.execute(query, params).fetchall()
+    columns = ["item_id", "text", "text_hash", "language_detected", "script", "source_type"]
+    return [dict(zip(columns, row, strict=True)) for row in rows]
+
+
+def count_scoped_remaining_candidates(
+    con: duckdb.DuckDBPyConnection, restrict_to_item_ids: set[str]
+) -> int:
+    """Total pending candidates within restrict_to_item_ids, no LIMIT -- mirrors
+    count_remaining_candidates for the scoped path (see select_scoped_candidate_items)."""
+    query = """
+        WITH scope_items AS (
+            SELECT UNNEST($scope_ids) AS item_id
+        )
+        SELECT count(*)
+        FROM processed.items i
+        JOIN scope_items sc ON i.item_id = sc.item_id
+        LEFT JOIN item_extraction_status s ON i.item_id = s.item_id
+        WHERE i.text IS NOT NULL AND i.text_hash IS NOT NULL AND s.item_id IS NULL
+    """
+    row = con.execute(query, {"scope_ids": list(restrict_to_item_ids)}).fetchone()
+    assert row is not None
+    return row[0]
+
+
 def estimate_api_calls(con: duckdb.DuckDBPyConnection, items: list[dict]) -> int:
     """Distinct text_hashes among the candidate batch not already in extraction_cache -- an upper bound (items sharing a hash within the same batch also dedupe against each other)."""
     distinct_hashes = {item["text_hash"] for item in items}
@@ -212,6 +274,8 @@ def run(
     extractors: list[EntityExtractor],
     model: str,
     cost_tracker: CostTracker,
+    restrict_to_item_ids: set[str] | None = None,
+    priority_item_ids: set[str] | None = None,
 ) -> tuple[RunStats, duckdb.DuckDBPyConnection, CostTracker]:
     """`extractors` is a pool of `concurrency` independent instances (see
     entities.build_extractor_pool) -- within one batch, slot i always calls
@@ -219,6 +283,14 @@ def run(
     `cost_tracker` is always caller-constructed (main() or an orchestrator
     like run_full_pipeline.py) -- that's where the provider is already known,
     so there's no need to guess it back out of `model` here.
+
+    restrict_to_item_ids, when given, switches candidate selection to
+    select_scoped_candidate_items -- restricted to that item_id universe
+    (e.g. an analysis_scope table) with priority_item_ids (default: empty,
+    meaning no priority tiering within the scope) as the priority-0 subset,
+    instead of clusters_only's corpus-wide, edge-based cluster definition.
+    `clusters_only`/`limit` still apply to the ORIGINAL (unscoped) path when
+    restrict_to_item_ids is None -- this is purely additive.
     """
     con = connect()
     resolver = resolution.EntityResolver(con)
@@ -227,90 +299,130 @@ def run(
     seed_created = resolution.load_seed_entities(resolver, config.SEED_ENTITIES_PATH)
     print(f"[extract_entities] seed entities: {seed_created} newly created (idempotent -- 0 on repeat runs)", flush=True)
 
-    total_remaining = count_remaining_candidates(con, clusters_only)
-    items = select_candidate_items(con, clusters_only, limit)
-    print(
-        f"[extract_entities] candidate items this invocation: {len(items)} "
-        f"(clusters_only={clusters_only}, limit={limit}); {total_remaining} total pending; concurrency={concurrency}",
-        flush=True,
-    )
+    if restrict_to_item_ids is not None:
+        total_remaining = count_scoped_remaining_candidates(con, restrict_to_item_ids)
+        items = select_scoped_candidate_items(con, restrict_to_item_ids, priority_item_ids or set(), limit)
+        print(
+            f"[extract_entities] candidate items this invocation: {len(items)} "
+            f"(scoped to {len(restrict_to_item_ids)} items, {len(priority_item_ids or set())} priority, limit={limit}); "
+            f"{total_remaining} total pending in scope; concurrency={concurrency}",
+            flush=True,
+        )
+    else:
+        total_remaining = count_remaining_candidates(con, clusters_only)
+        items = select_candidate_items(con, clusters_only, limit)
+        print(
+            f"[extract_entities] candidate items this invocation: {len(items)} "
+            f"(clusters_only={clusters_only}, limit={limit}); {total_remaining} total pending; concurrency={concurrency}",
+            flush=True,
+        )
 
     estimated = estimate_api_calls(con, items)
     print(f"[extract_entities] estimated API calls: {estimated}", flush=True)
 
     stats = RunStats()
     last_progress_print = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        for batch_start in range(0, len(items), concurrency):
+    run_start = time.monotonic()
+
+    def print_progress() -> None:
+        nonlocal last_progress_print
+        if stats.items_considered - last_progress_print >= PROGRESS_EVERY or stats.items_considered == len(items):
+            elapsed_min = (time.monotonic() - run_start) / 60
+            rate = stats.items_considered / elapsed_min if elapsed_min > 0 else 0.0
+            print(
+                f"[extract_entities] {cost_tracker.progress_line(stats.items_considered, total_remaining)} "
+                f"-- {rate:.1f} items/min",
+                flush=True,
+            )
+            last_progress_print = stats.items_considered
+
+    # Rolling worker pool, not lockstep batches: up to `concurrency` calls
+    # are in flight at all times, and the instant one finishes, the next
+    # pending item is submitted immediately -- a fast call never sits idle
+    # waiting for the slowest call in a fixed-size "batch" to finish (the
+    # old batch-lockstep design measurably wasted throughput this way).
+    # cost_tracker.would_exceed() is checked in submit_next_call() before
+    # EVERY new submission, not once per batch -- so once spend nears the
+    # cap, no new calls launch, while whatever's already in flight (at most
+    # `concurrency` of them) finishes normally; worst-case overshoot is
+    # bounded to that in-flight set, never a full extra batch beyond it.
+    # cost_tracker.add() is still only ever called from this main thread
+    # (after a worker's Future completes, never from inside a worker) --
+    # single-writer by construction, no lock needed for thread safety.
+    items_iter = iter(items)
+    available_slots = list(range(concurrency))
+    in_flight: dict[Future, tuple[dict, int]] = {}
+
+    def submit_next_call() -> bool:
+        """Pulls from items_iter, finalizing free cache hits inline (they
+        never occupy a worker slot), until it either submits one real API
+        call (returns True) or runs out of reasons to keep going -- the
+        cost cap or an exhausted item list (returns False)."""
+        for item in items_iter:
+            cached = resolution.get_cached_extraction(con, item["text_hash"])
+            if cached is not None:
+                stats.cache_hits += 1
+                _finalize_item(con, resolver, item, cached, stats)
+                print_progress()
+                continue
             if cost_tracker.would_exceed():
                 stats.stopped_early_reason = f"cost cap (${cost_tracker.max_cost:.2f}) reached"
-                print(f"\n[extract_entities] STOPPING: {stats.stopped_early_reason}. Rerun to continue -- already-processed items are cached.", flush=True)
-                break
+                return False
+            slot = available_slots.pop()
+            extractor = extractors[slot]  # this slot's instance is free -- nothing else is using it right now
+            context = {
+                "language_detected": item["language_detected"],
+                "script": item["script"],
+                "source_type": item["source_type"],
+            }
+            in_flight[pool.submit(extractor.extract, item["text"], context=context)] = (item, slot)
+            return True
+        return False
 
-            batch = items[batch_start : batch_start + concurrency]
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        try:
+            for _ in range(concurrency):
+                if not submit_next_call():
+                    break
 
-            # Cache lookups are cheap sequential DB reads -- split the batch
-            # into "already cached" (finalized immediately) vs "needs an
-            # API call" (dispatched to the thread pool below).
-            to_call: list[dict] = []
-            for item in batch:
-                cached = resolution.get_cached_extraction(con, item["text_hash"])
-                if cached is not None:
-                    stats.cache_hits += 1
-                    _finalize_item(con, resolver, item, cached, stats)
-                else:
-                    to_call.append(item)
+            while in_flight:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                refill_budget = 0
+                for future in done:
+                    item, slot = in_flight.pop(future)
+                    available_slots.append(slot)
+                    refill_budget += 1
+                    extractor = extractors[slot]
+                    try:
+                        mentions = future.result()
+                    except (GeminiFreeTierError, GeminiBillingExhaustedError, GeminiDailyQuotaExhaustedError):
+                        raise  # systemic -- stop the whole run, see outer except
+                    except Exception as item_error:  # noqa: BLE001 -- deliberately broad: isolate one item's failure (e.g. a 503 that outlasted every retry) from crashing the whole run
+                        # Leave it uncached/unmarked so a later run retries it naturally.
+                        stats.failed_items.append((item["item_id"], str(item_error)[:200]))
+                        continue
+                    stats.api_calls += 1
+                    if extractor.last_usage_tokens is not None:  # type: ignore[attr-defined]
+                        cost_tracker.add(*extractor.last_usage_tokens)  # type: ignore[attr-defined]
+                        extractor.last_usage_tokens = None  # type: ignore[attr-defined]
+                    resolution.store_extraction_cache(con, item["text_hash"], mentions, model=model)
+                    _finalize_item(con, resolver, item, mentions, stats)
+                    print_progress()
 
-            if to_call:
-                futures = {}
-                for slot, item in enumerate(to_call):
-                    extractor = extractors[slot]  # slot < concurrency always -- no two calls share an instance
-                    context = {
-                        "language_detected": item["language_detected"],
-                        "script": item["script"],
-                        "source_type": item["source_type"],
-                    }
-                    futures[pool.submit(extractor.extract, item["text"], context=context)] = (item, extractor)
+                if stats.stopped_early_reason is None:
+                    for _ in range(refill_budget):
+                        if not submit_next_call():
+                            break
+        except (GeminiFreeTierError, GeminiBillingExhaustedError, GeminiDailyQuotaExhaustedError) as e:
+            stats.stopped_early_reason = f"Gemini fatal error: {e}"
+            raise
 
-                try:
-                    # as_completed, not futures.items(): blocking in
-                    # submission order meant one slow call in a batch stalled
-                    # writing back the other (already-finished) results in
-                    # that same batch -- observed in practice as an apparent
-                    # hang while 15/16 workers sat on completed-but-unread
-                    # futures.
-                    for future in as_completed(futures):
-                        item, extractor = futures[future]
-                        try:
-                            mentions = future.result()
-                        except (GeminiFreeTierError, GeminiBillingExhaustedError, GeminiDailyQuotaExhaustedError):
-                            raise  # systemic -- stop the whole run, see outer except
-                        except Exception as item_error:  # noqa: BLE001 -- deliberately broad: isolate one item's failure (e.g. a 503 that outlasted every retry) from crashing the whole run
-                            # Leave it uncached/unmarked so a later run
-                            # retries it naturally; log it and move on.
-                            stats.failed_items.append((item["item_id"], str(item_error)[:200]))
-                            continue
-                        stats.api_calls += 1
-                        if extractor.last_usage_tokens is not None:  # type: ignore[attr-defined]
-                            cost_tracker.add(*extractor.last_usage_tokens)  # type: ignore[attr-defined]
-                            extractor.last_usage_tokens = None  # type: ignore[attr-defined]
-                        resolution.store_extraction_cache(con, item["text_hash"], mentions, model=model)
-                        _finalize_item(con, resolver, item, mentions, stats)
-                except (GeminiFreeTierError, GeminiBillingExhaustedError, GeminiDailyQuotaExhaustedError) as e:
-                    stats.stopped_early_reason = f"Gemini fatal error: {e}"
-                    raise
-
-            time.sleep(BATCH_SLEEP_SECONDS)
-
-            # Threshold-based, not modulo: batch size (concurrency) and
-            # PROGRESS_EVERY don't generally share a common divisor (e.g.
-            # concurrency=16, PROGRESS_EVERY=25 only coincide every 400
-            # items via modulo), which silently suppressed progress output
-            # for an entire run in practice. This prints as soon as enough
-            # new items have landed since the last print, regardless of batch size.
-            if stats.items_considered - last_progress_print >= PROGRESS_EVERY or stats.items_considered == len(items):
-                print(f"[extract_entities] {cost_tracker.progress_line(stats.items_considered, total_remaining)}", flush=True)
-                last_progress_print = stats.items_considered
+    if stats.stopped_early_reason:
+        print(
+            f"\n[extract_entities] STOPPING: {stats.stopped_early_reason}. "
+            "Rerun to continue -- already-processed items are cached.",
+            flush=True,
+        )
 
     return stats, con, cost_tracker
 

@@ -10,6 +10,7 @@ needed for a backend-only, no-frontend-yet validation pass.
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import duckdb
 
@@ -151,14 +152,15 @@ def _ranked_author_to_dict(r: profiles.RankedAuthor) -> dict:
     return dataclasses.asdict(r)
 
 
-def get_entity_authors(con: duckdb.DuckDBPyConnection, entity_id: str, limit: int) -> dict | None:
+def get_entity_authors(con: duckdb.DuckDBPyConnection, entity_id: str, limit: int, min_volume: int = 5) -> dict | None:
     row = con.execute("SELECT canonical_name FROM entities WHERE entity_id = ?", [entity_id]).fetchone()
     if row is None:
         return None
-    positive, negative = profiles.query_entity_authors(con, entity_id, limit=limit)
+    positive, negative = profiles.query_entity_authors(con, entity_id, limit=limit, min_volume=min_volume)
     return {
         "entity_id": entity_id,
         "canonical_name": row[0],
+        "min_volume": min_volume,
         "consistently_positive": [_ranked_author_to_dict(r) for r in positive],
         "consistently_negative": [_ranked_author_to_dict(r) for r in negative],
     }
@@ -399,3 +401,289 @@ def get_coordination_graph(con: duckdb.DuckDBPyConnection, min_edges: int, limit
         )
 
     return {"nodes": nodes, "edges": edges}
+
+
+def _build_source_url(source_type: str | None, source_specific_json: str | None) -> str | None:
+    """Construct the real, openable link back to the original post, from
+    source_specific's per-platform fields -- None (not a raised error) when
+    the fields needed aren't present, so callers fall back to raw
+    identifiers (item_id/source_native_id) for provenance instead of
+    breaking the response.
+    """
+    if not source_specific_json:
+        return None
+    try:
+        spec = json.loads(source_specific_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(spec, dict):
+        return None
+
+    if source_type == "telegram":
+        username = spec.get("channel_username")
+        message_id = spec.get("message_id")
+        if username and message_id is not None:
+            return f"https://t.me/{username}/{message_id}"
+        return None
+    if source_type == "channel":
+        # A Telegram channel-metadata record (not an individual post) --
+        # links to the channel itself, not a specific message.
+        username = spec.get("channel_username")
+        if username:
+            return f"https://t.me/{username}"
+        return None
+    if source_type == "youtube_video":
+        video_id = spec.get("video_id")
+        if video_id:
+            return f"https://youtube.com/watch?v={video_id}"
+        return None
+    return None
+
+
+def get_author_entity_sources(
+    con: duckdb.DuckDBPyConnection, author_id: str, entity_id: str, limit: int
+) -> dict | None:
+    """Query #source-drilldown: the actual items behind one author's stance
+    profile toward one entity -- what /api/author/{id}/entity/{id}/sources
+    (and any UI click-through on a profile row) resolves to. None if either
+    the entity or the author doesn't exist at all (no items ever attributed
+    to that author_id) -- an author that exists but has no stance edges
+    toward this particular entity still gets a 200 with an empty list,
+    since that's a real (if uninteresting) answer, not a 404.
+    """
+    entity_row = con.execute("SELECT canonical_name FROM entities WHERE entity_id = ?", [entity_id]).fetchone()
+    if entity_row is None:
+        return None
+
+    author_row = con.execute(
+        "SELECT count(*) FROM processed.items WHERE source_type || ':' || author_native_id = ?",
+        [author_id],
+    ).fetchone()
+    if author_row is None or author_row[0] == 0:
+        return None
+
+    rows = con.execute(
+        """
+        SELECT se.item_id, i.source_type, i.source_native_id, i.source_specific,
+               i.published_at, se.polarity, se.strength, se.confidence,
+               substr(coalesce(i.text, ''), 1, 500) AS text_snippet,
+               substr(coalesce(i.source_specific -> 'transcript' ->> 'text', ''), 1, 500) AS transcript_snippet
+        FROM entity_stance_edges se
+        JOIN processed.items i ON i.item_id = se.item_id
+        WHERE se.entity_id = ? AND i.source_type || ':' || i.author_native_id = ?
+        ORDER BY i.published_at DESC
+        LIMIT ?
+        """,
+        [entity_id, author_id, limit],
+    ).fetchall()
+
+    items = [
+        {
+            "item_id": item_id,
+            "source_type": source_type,
+            "published_at": published_at,
+            "polarity": polarity,
+            "strength": strength,
+            "confidence": confidence,
+            "text": text_snippet or None,
+            "transcript_snippet": transcript_snippet or None,
+            "source_url": _build_source_url(source_type, source_specific),
+            "source_native_id": source_native_id,
+        }
+        for item_id, source_type, source_native_id, source_specific, published_at, polarity, strength,
+        confidence, text_snippet, transcript_snippet in rows
+    ]
+
+    return {
+        "author_id": author_id,
+        "entity_id": entity_id,
+        "canonical_name": entity_row[0],
+        "n_items": len(items),
+        "items": items,
+    }
+
+
+def get_cluster_items(con: duckdb.DuckDBPyConnection, cluster_id: str) -> dict | None:
+    """Query #source-drilldown: the full set of items in one coordination
+    cluster -- `cluster_id` is any item_id known to be a member (there is no
+    separately-persisted stable cluster identifier yet, see
+    analysis/scope.py's compute_coordination_clusters docstring: its
+    cluster_id is only a per-call union-find root, not stable across runs).
+    Given any member item_id, a recursive CTE over processed.edges'
+    shared_media/near_duplicate_text derived edges finds the rest of that
+    item's connected component live -- cheap in practice (bounded by the
+    cluster's own size, not the whole corpus: ~0.2s for a several-hundred-
+    author edge_count observed in testing), so no separate persistence is
+    needed for this to serve a live drill-down click.
+
+    None only if `cluster_id` isn't a real item_id at all; a real item with
+    no cluster edges still returns successfully as a cluster of size 1.
+    """
+    seed_exists = con.execute(
+        "SELECT count(*) FROM processed.items WHERE item_id = ?", [cluster_id]
+    ).fetchone()
+    if seed_exists is None or seed_exists[0] == 0:
+        return None
+
+    member_rows = con.execute(
+        """
+        WITH RECURSIVE cluster_items(item_id) AS (
+            SELECT $seed::VARCHAR
+            UNION
+            SELECT CASE WHEN e.src_item_id = ci.item_id THEN e.dst_item_id ELSE e.src_item_id END
+            FROM cluster_items ci
+            JOIN processed.edges e
+              ON (e.src_item_id = ci.item_id OR e.dst_item_id = ci.item_id)
+             AND e.origin = 'derived' AND e.edge_type IN ('shared_media', 'near_duplicate_text')
+        )
+        SELECT DISTINCT item_id FROM cluster_items
+        """,
+        {"seed": cluster_id},
+    ).fetchall()
+    member_ids = [r[0] for r in member_rows]
+
+    detail_rows = con.execute(
+        """
+        SELECT item_id, source_type, source_native_id, source_specific, author_native_id,
+               author_display_name, published_at, substr(coalesce(text, ''), 1, 300) AS text_snippet
+        FROM processed.items
+        WHERE item_id IN (SELECT UNNEST($ids))
+        ORDER BY published_at
+        """,
+        {"ids": member_ids},
+    ).fetchall()
+
+    items = []
+    distinct_authors: set[str] = set()
+    for (
+        item_id, source_type, source_native_id, source_specific, author_native_id,
+        author_display_name, published_at, text_snippet,
+    ) in detail_rows:
+        author_id = f"{source_type}:{author_native_id}" if author_native_id else None
+        if author_id:
+            distinct_authors.add(author_id)
+        items.append(
+            {
+                "item_id": item_id,
+                "author_id": author_id,
+                "author_display_name": author_display_name,
+                "source_type": source_type,
+                "published_at": published_at,
+                "text_snippet": text_snippet,
+                "source_url": _build_source_url(source_type, source_specific),
+                "source_native_id": source_native_id,
+            }
+        )
+
+    return {
+        "cluster_id": cluster_id,
+        "size": len(items),
+        "distinct_authors": len(distinct_authors),
+        "items": items,
+    }
+
+
+def get_item_detail(con: duckdb.DuckDBPyConnection, item_id: str) -> dict | None:
+    row = con.execute(
+        """
+        SELECT item_id, source_type, source_native_id, source_specific,
+               author_native_id, author_display_name, published_at, text
+        FROM processed.items WHERE item_id = ?
+        """,
+        [item_id],
+    ).fetchone()
+    if row is None:
+        return None
+    (
+        item_id, source_type, source_native_id, source_specific,
+        author_native_id, author_display_name, published_at, text,
+    ) = row
+
+    transcript = None
+    if source_specific:
+        try:
+            spec = json.loads(source_specific)
+        except (json.JSONDecodeError, TypeError):
+            spec = None
+        if isinstance(spec, dict):
+            transcript_obj = spec.get("transcript")
+            if isinstance(transcript_obj, dict):
+                transcript = transcript_obj.get("text")
+
+    author_id = f"{source_type}:{author_native_id}" if author_native_id else None
+
+    entity_rows = con.execute(
+        """
+        SELECT e.entity_id, e.canonical_name, e.entity_type, ie.surface_form,
+               se.polarity, se.strength, se.confidence
+        FROM item_entities ie
+        JOIN entities e ON e.entity_id = ie.entity_id
+        LEFT JOIN entity_stance_edges se ON se.item_id = ie.item_id AND se.entity_id = ie.entity_id
+        WHERE ie.item_id = ?
+        """,
+        [item_id],
+    ).fetchall()
+    entities_found = [
+        {
+            "entity_id": r[0],
+            "canonical_name": r[1],
+            "entity_type": r[2],
+            "surface_form": r[3],
+            "polarity": r[4],
+            "strength": r[5],
+            "confidence": r[6],
+        }
+        for r in entity_rows
+    ]
+
+    return {
+        "item_id": item_id,
+        "source_type": source_type,
+        "author_id": author_id,
+        "author_display_name": author_display_name,
+        "published_at": published_at,
+        "text": text,
+        "transcript": transcript,
+        "source_url": _build_source_url(source_type, source_specific),
+        "source_native_id": source_native_id,
+        "entities": entities_found,
+    }
+
+
+def get_topic_coordination(con: duckdb.DuckDBPyConnection, topic_query: str, limit: int) -> dict:
+    """Query #source-drilldown / NLP-query support: which coordination
+    clusters (tight, multi-author narratives) touch a free-text topic
+    keyword -- e.g. "Operation Sindoor" -> the reposted-content clusters
+    whose member items mention it. Reuses the already-computed 'tight'
+    narratives (build_narratives.py) rather than a fresh graph traversal
+    per request; a plain parameterized ILIKE against member text, so this
+    stays a safe, pre-defined query (no user-composed SQL) even though the
+    match text itself is free-form.
+    """
+    rows = con.execute(
+        """
+        SELECT n.narrative_id, n.size, n.distinct_authors, n.time_range_start, n.time_range_end,
+               any_value(substr(i.text, 1, 200)) AS sample_text
+        FROM narratives n
+        JOIN narrative_members nm ON nm.narrative_id = n.narrative_id
+        JOIN processed.items i ON i.item_id = nm.item_id
+        WHERE n.basis = 'tight' AND n.distinct_authors > 1
+          AND concat_ws(' ', i.text, i.source_specific -> 'transcript' ->> 'text') ILIKE ?
+        GROUP BY n.narrative_id, n.size, n.distinct_authors, n.time_range_start, n.time_range_end
+        ORDER BY n.distinct_authors DESC, n.size DESC
+        LIMIT ?
+        """,
+        [f"%{topic_query}%", limit],
+    ).fetchall()
+    clusters = [
+        {
+            "narrative_id": r[0],
+            "size": r[1],
+            "distinct_authors": r[2],
+            "time_range_start": r[3],
+            "time_range_end": r[4],
+            "sample_text": r[5],
+        }
+        for r in rows
+    ]
+    return {"topic_query": topic_query, "clusters": clusters}
