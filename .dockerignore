@@ -1,0 +1,33 @@
+# Data is mounted at runtime (see docker-compose.yml), never baked into the
+# image -- also 7GB+, which would balloon the build context to a crawl.
+data/
+
+# Local environments / caches -- never useful inside the image, and copying
+# a host .venv (built for the host's Python/arch) into a Linux container
+# would just break things anyway.
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+.git/
+.gitignore
+.dockerignore
+
+# Secrets -- never copied into an image layer.
+.env
+.env.example
+
+# Editor / OS cruft, misc large local artifacts not needed to run the app.
+.DS_Store
+.vscode/
+.claude/
+*.session
+*.session-journal
+docs/
+tests/
+results/

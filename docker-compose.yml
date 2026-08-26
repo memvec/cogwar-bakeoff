@@ -1,0 +1,46 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # Read-only: the app (serve/) never writes to these DBs, only the
+      # separate analysis-pipeline CLI scripts do, and those aren't run
+      # inside this container.
+      - ./data:/app/data:ro
+    environment:
+      # DNS name of the ollama service below, reachable because both
+      # services share the cogwar-net network -- compose resolves it, no
+      # port-mapping or IP needed. Override OLLAMA_MODEL from the host
+      # shell/.env to run a smaller/larger model without editing this file.
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:7b-instruct}
+    depends_on:
+      - ollama
+    networks:
+      - cogwar-net
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      # Named volume, not a bind mount -- pulled models (several GB each)
+      # persist across `docker compose down`/`up` without living on the
+      # host's filesystem or in any image layer.
+      - ollama_models:/root/.ollama
+    networks:
+      - cogwar-net
+    # Documentation only (compose's shared network already lets `app` reach
+    # this on 11434 by service name regardless of `expose`) -- deliberately
+    # no `ports:` here, so 11434 is never reachable from outside the compose
+    # network, only from other services on cogwar-net.
+    expose:
+      - "11434"
+
+volumes:
+  ollama_models:
+
+networks:
+  cogwar-net:
+    driver: bridge

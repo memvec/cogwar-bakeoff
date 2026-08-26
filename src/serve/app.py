@@ -1,8 +1,21 @@
-"""FastAPI app. Run with: uv run uvicorn serve.app:app --reload
+"""FastAPI app. Run with: uv run uvicorn serve.app:app --app-dir src --reload
 
 Every route is a thin wrapper: parse params, call into queries.py, 404 on
 None, return the dict/list as-is (FastAPI JSON-encodes it, including the
 datetime/date values DuckDB hands back).
+
+The frontend/ static files are mounted at "/" (see the bottom of this
+file, after every /api/* route) so one process serves both the UI and the
+API -- exactly what the Docker image runs. "frontend" is a plain relative
+path, resolved against the process's working directory: the repo root for
+a bare `uvicorn ... --app-dir src` invocation (this docstring's command,
+run from the repo root) and /app in the container (Dockerfile sets
+WORKDIR /app and copies frontend/ there) -- same relative-path resolution
+serve.config's DB paths already rely on, so no environment-specific
+branching is needed here either. The mount is added LAST because
+Starlette matches routes in registration order: every explicit /api/*
+path above is checked first, and only a request matching none of them
+falls through to this catch-all.
 """
 
 from __future__ import annotations
@@ -12,6 +25,7 @@ from typing import Annotated
 import duckdb
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from serve import ask as ask_module
@@ -164,3 +178,7 @@ def ask(con: Conn, body: AskRequest) -> dict:
         "summary": result.summary,
         "error": result.error,
     }
+
+
+# Registered last -- see the module docstring for why route order matters here.
+app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")

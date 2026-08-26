@@ -1,7 +1,8 @@
 """POST /api/ask -- natural-language question -> structured query -> answer.
 
-Local model only (Ollama qwen2.5:7b-instruct), one call per question, free.
-The model's ONLY job is to pick one of a small fixed set of query_types and
+Local model only (Ollama, see serve.config.OLLAMA_MODEL), one call per
+question, free. The model's ONLY job is to pick one of a small fixed set
+of query_types and
 extract plain-text params (an entity name, an author name, a topic phrase)
 from the question -- it never sees the database, never generates SQL, and
 never gets taught the id vocabulary. Every query_type maps 1:1 to an
@@ -20,8 +21,8 @@ from dataclasses import dataclass, field
 import duckdb
 
 from serve import queries, resolve
+from serve.config import OLLAMA_HOST, OLLAMA_MODEL
 
-_MODEL = "qwen2.5:7b-instruct"
 _MAX_OUTPUT_TOKENS = 512
 
 _VALID_QUERY_TYPES = {
@@ -76,8 +77,14 @@ class AskResult:
 def _call_router(question: str) -> dict:
     import ollama
 
-    response = ollama.chat(
-        model=_MODEL,
+    # Explicit host= (rather than the module-level ollama.chat() convenience
+    # function, which reads OLLAMA_HOST only once at import time) so this
+    # always reflects the current env var -- OLLAMA_HOST unset -> local
+    # `ollama serve` default; OLLAMA_HOST=http://ollama:11434 -> the
+    # docker-compose `ollama` service, set in docker-compose.yml.
+    client = ollama.Client(host=OLLAMA_HOST)
+    response = client.chat(
+        model=OLLAMA_MODEL,
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": question},

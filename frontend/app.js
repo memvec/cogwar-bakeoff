@@ -1,6 +1,10 @@
-// Point this at the deployed backend -- everything else in this file reads
-// from API_BASE, nothing else hardcodes a host.
-const API_BASE = "http://127.0.0.1:8000";
+// Empty string -- relative to whatever origin served this page. FastAPI
+// mounts this frontend and the /api/* routes on the same origin (see
+// serve/app.py), so this works unchanged whether that origin is
+// http://localhost:8000, http://127.0.0.1:8000, or a deployed host's public
+// IP/domain. Point this at an explicit "http://host:port" only if the
+// frontend is ever served from a different origin than the API.
+const API_BASE = "";
 
 // ============================================================ fetch helpers
 
